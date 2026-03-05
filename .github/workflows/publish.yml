@@ -1,0 +1,44 @@
+name: Publish to PyPI
+
+# Run this workflow manually from the Actions tab after tagging a release.
+# Before triggering:
+#   git tag v0.x.y
+#   git push --tags
+#
+# PyPI Trusted Publishing (OIDC) is used — no API token stored in secrets.
+# One-time setup on PyPI: add a "Trusted Publisher" for this repo/workflow.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-publish:
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+
+    # Required for PyPI Trusted Publishing (OIDC token exchange)
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history so setuptools-scm picks up the tag
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check distributions
+        run: twine check dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No username/password needed — OIDC handles authentication.

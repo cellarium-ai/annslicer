@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=68", "setuptools-scm>=8"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "annslicer"
+dynamic = ["version"]
+description = "Out-of-core sharding of large .h5ad AnnData files with minimal memory usage."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "sfleming" }]
+keywords = ["anndata", "h5ad", "bioinformatics", "single-cell", "genomics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "anndata>=0.9",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "h5py>=3.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "build",
+    "twine",
+]
+
+[project.scripts]
+annslice = "annslicer.core:main"
+
+[project.urls]
+Homepage = "https://github.com/sfleming/annslicer"
+"Bug Tracker" = "https://github.com/sfleming/annslicer/issues"
+
+# ---------------------------------------------------------------------------
+# setuptools-scm: derive version from git tags (e.g. `git tag v0.1.0`)
+# ---------------------------------------------------------------------------
+[tool.setuptools_scm]
+# Writes src/annslicer/_version.py so the version is available at runtime
+# without requiring the package to be installed from PyPI.
+write_to = "src/annslicer/_version.py"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ---------------------------------------------------------------------------
+# Ruff — linter + formatter
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py310"
+line-length = 99
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# E/W: pycodestyle  F: Pyflakes  I: isort  UP: pyupgrade  B: flake8-bugbear
+select = ["E", "W", "F", "I", "UP", "B"]
+ignore = ["E501"]  # line length is handled by ruff format, not lint
+
+[tool.ruff.lint.isort]
+known-first-party = ["annslicer"]
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
