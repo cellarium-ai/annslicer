@@ -84,6 +84,20 @@ Output format is inferred from the extension — use `.zarr` for Zarr output (re
 annslicer merge output.zarr shard_0.h5ad shard_1.h5ad shard_2.h5ad
 ```
 
+Input files can also be specified as glob patterns (expanded lexicographically):
+
+```bash
+annslicer merge output.h5ad "shards/atlas_shard_*.h5ad"
+```
+
+| Argument | Description |
+|---|---|
+| `output_file` | Path for the merged output file (`.h5ad` or `.zarr`) |
+| `input_files` | One or more shard paths or glob patterns, in order |
+| `--join {inner,outer}` | How to join var (gene) axes when files differ (default: `outer`) |
+
+When shards have **different gene sets**, `--join outer` (default) takes the union of all genes and fills missing entries with zeros; `--join inner` keeps only genes present in every shard. Layers absent from any shard are always dropped.
+
 ### Global options
 
 | Flag | Description |
@@ -102,8 +116,14 @@ shard_h5ad("large_atlas.zarr", "atlas", shard_size=20000)  # requires annslicer[
 # Shuffled sharding — cells are randomly distributed across shards
 shard_h5ad("large_atlas.h5ad", "atlas", shard_size=20000, shuffle=True, seed=0)
 
-# Merge shards back into one file
+# Merge shards back into one file (identical-var fast path used automatically)
 merge_out_of_core(["atlas_shard_0.h5ad", "atlas_shard_1.h5ad"], "merged.h5ad")
+
+# Merge shards with different gene sets — outer join (union, fills absent genes with 0)
+merge_out_of_core(["shard_a.h5ad", "shard_b.h5ad"], "merged.h5ad", join="outer")
+
+# Merge shards with different gene sets — inner join (intersection only)
+merge_out_of_core(["shard_a.h5ad", "shard_b.h5ad"], "merged.h5ad", join="inner")
 ```
 
 ## How it works
@@ -116,9 +136,11 @@ merge_out_of_core(["atlas_shard_0.h5ad", "atlas_shard_1.h5ad"], "merged.h5ad")
 5. Reassembles a valid `AnnData` object per shard and writes it to disk.
 
 ### Merging
-1. Reads `obs`, `var`, and `uns` from the shards to build a skeleton output file.
-2. Scans shards to calculate total non-zero sizes for pre-allocation.
-3. Streams `X`, layers, and `obsm` data shard-by-shard directly into the pre-allocated output arrays.
+1. Reads `obs`, `var`, and `uns` from **all** shards to build a skeleton output file.
+2. Computes the merged `var` index: union (outer join) or intersection (inner join) of gene sets across all shards. If every shard shares the identical `var`, remapping is skipped entirely (fast path).
+3. Scans shards to calculate total non-zero sizes for pre-allocation (for an inner join, entries for excluded genes are filtered during the scan).
+4. Streams `X`, layers, and `obsm` data shard-by-shard directly into the pre-allocated output arrays, remapping column indices on the fly where needed.
+5. Layers absent from any shard are dropped so every cell has consistent layer coverage.
 
 > **Note:** CSC (column-compressed) sparse matrices are not supported for out-of-core row-slicing. Convert to CSR before sharding.
 
