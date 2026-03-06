@@ -9,6 +9,7 @@ from pathlib import Path
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 import pytest
 import scipy.sparse as sp
 
@@ -218,3 +219,211 @@ def test_zarr_slice_merge_to_h5ad(synthetic_zarr: str, tmp_path) -> None:
     assert "counts" in merged.layers
     assert "X_pca" in merged.obsm
     np.testing.assert_array_almost_equal(_to_dense(merged.X), _to_dense(original.X))
+
+
+# ---------------------------------------------------------------------------
+# var join tests (inner / outer) — mismatched gene sets
+# ---------------------------------------------------------------------------
+
+# Two tiny shards with partially overlapping genes:
+#   Shard A: genes 0-39  (40 genes)
+#   Shard B: genes 10-49 (40 genes)
+#   Overlap (inner join result): genes 10-39 (30 genes)
+#   Union  (outer join result):  genes 0-49  (50 genes)
+
+_JOIN_N_CELLS = 20
+_JOIN_GENES_A = [f"g{i:04d}" for i in range(40)]  # g0000–g0039
+_JOIN_GENES_B = [f"g{i:04d}" for i in range(10, 50)]  # g0010–g0049
+_JOIN_OVERLAP = [f"g{i:04d}" for i in range(10, 40)]  # 30 genes
+_JOIN_UNION = [f"g{i:04d}" for i in range(50)]  # 50 genes
+
+
+def _make_shard(
+    tmp_path: Path,
+    name: str,
+    gene_names: list[str],
+    n_cells: int = _JOIN_N_CELLS,
+    *,
+    with_layer: bool = True,
+) -> str:
+    """Create a small synthetic h5ad shard with the given gene set."""
+    n_genes = len(gene_names)
+    X = sp.random(n_cells, n_genes, density=0.3, format="csr", random_state=42).astype(np.float32)
+    obs = pd.DataFrame(index=[f"{name}_cell{i}" for i in range(n_cells)])
+    var = pd.DataFrame(index=gene_names)
+    layers = {"counts": X.copy()} if with_layer else {}
+    adata = ad.AnnData(X=X, obs=obs, var=var, layers=layers)
+    path = str(tmp_path / f"{name}.h5ad")
+    adata.write_h5ad(path)
+    return path
+
+
+@pytest.fixture()
+def mismatched_pair(tmp_path: Path) -> tuple[str, str, ad.AnnData, ad.AnnData]:
+    """Two shards with overlapping but non-identical gene sets. Returns (pathA, pathB, adataA, adataB)."""
+    path_a = _make_shard(tmp_path, "A", _JOIN_GENES_A)
+    path_b = _make_shard(tmp_path, "B", _JOIN_GENES_B)
+    return path_a, path_b, ad.read_h5ad(path_a), ad.read_h5ad(path_b)
+
+
+def test_outer_join_var_is_union(mismatched_pair: tuple, tmp_path: Path) -> None:
+    path_a, path_b, _, _ = mismatched_pair
+    out = str(tmp_path / "outer.h5ad")
+    merge_out_of_core([path_a, path_b], out, join="outer")
+    merged = ad.read_h5ad(out)
+    assert merged.n_vars == len(_JOIN_UNION)
+    assert list(merged.var_names) == _JOIN_UNION
+
+
+def test_outer_join_cell_count(mismatched_pair: tuple, tmp_path: Path) -> None:
+    path_a, path_b, _, _ = mismatched_pair
+    out = str(tmp_path / "outer.h5ad")
+    merge_out_of_core([path_a, path_b], out, join="outer")
+    merged = ad.read_h5ad(out)
+    assert merged.n_obs == _JOIN_N_CELLS * 2
+
+
+def test_outer_join_X_values_for_overlap_genes(mismatched_pair: tuple, tmp_path: Path) -> None:
+    """For genes present in shard A, merged rows for shard-A cells must match the original."""
+    path_a, path_b, adata_a, _ = mismatched_pair
+    out = str(tmp_path / "outer.h5ad")
+    merge_out_of_core([path_a, path_b], out, join="outer")
+    merged = ad.read_h5ad(out)
+
+    # Rows 0:_JOIN_N_CELLS belong to shard A; columns for genes 0-39
+    merged_X = _to_dense(merged.X)
+    orig_X = _to_dense(adata_a.X)
+    # Gene indices in merged var for genes g0000-g0039 are 0-39 (same positions)
+    np.testing.assert_array_almost_equal(merged_X[:_JOIN_N_CELLS, :40], orig_X)
+
+
+def test_outer_join_X_zeros_for_absent_genes(mismatched_pair: tuple, tmp_path: Path) -> None:
+    """Cells from shard A should have zeros for genes g0040-g0049 (only in shard B)."""
+    path_a, path_b, _, _ = mismatched_pair
+    out = str(tmp_path / "outer.h5ad")
+    merge_out_of_core([path_a, path_b], out, join="outer")
+    merged = ad.read_h5ad(out)
+    merged_X = _to_dense(merged.X)
+    # genes g0040-g0049 are columns 40-49 in merged var
+    np.testing.assert_array_equal(merged_X[:_JOIN_N_CELLS, 40:], 0)
+
+
+def test_outer_join_is_default(mismatched_pair: tuple, tmp_path: Path) -> None:
+    """Calling merge_out_of_core without join= should behave identically to join='outer'."""
+    path_a, path_b, _, _ = mismatched_pair
+    out_default = str(tmp_path / "default.h5ad")
+    out_outer = str(tmp_path / "outer.h5ad")
+    merge_out_of_core([path_a, path_b], out_default)
+    merge_out_of_core([path_a, path_b], out_outer, join="outer")
+    m_default = ad.read_h5ad(out_default)
+    m_outer = ad.read_h5ad(out_outer)
+    assert list(m_default.var_names) == list(m_outer.var_names)
+    np.testing.assert_array_equal(_to_dense(m_default.X), _to_dense(m_outer.X))
+
+
+def test_inner_join_var_is_intersection(mismatched_pair: tuple, tmp_path: Path) -> None:
+    path_a, path_b, _, _ = mismatched_pair
+    out = str(tmp_path / "inner.h5ad")
+    merge_out_of_core([path_a, path_b], out, join="inner")
+    merged = ad.read_h5ad(out)
+    assert merged.n_vars == len(_JOIN_OVERLAP)
+    assert list(merged.var_names) == _JOIN_OVERLAP
+
+
+def test_inner_join_X_values_correct(mismatched_pair: tuple, tmp_path: Path) -> None:
+    """Spot-check that inner-joined X has the expected values from each shard."""
+    path_a, path_b, adata_a, adata_b = mismatched_pair
+    out = str(tmp_path / "inner.h5ad")
+    merge_out_of_core([path_a, path_b], out, join="inner")
+    merged = ad.read_h5ad(out)
+    merged_X = _to_dense(merged.X)
+
+    # Shard A rows in merged: columns are genes g0010-g0039
+    # In shard A, those are columns 10-39.
+    orig_a = _to_dense(adata_a.X)
+    np.testing.assert_array_almost_equal(merged_X[:_JOIN_N_CELLS, :], orig_a[:, 10:40])
+
+    # Shard B rows in merged: columns are genes g0010-g0039
+    # In shard B, those are columns 0-29.
+    orig_b = _to_dense(adata_b.X)
+    np.testing.assert_array_almost_equal(merged_X[_JOIN_N_CELLS:, :], orig_b[:, :30])
+
+
+def test_inner_join_cell_count(mismatched_pair: tuple, tmp_path: Path) -> None:
+    path_a, path_b, _, _ = mismatched_pair
+    out = str(tmp_path / "inner.h5ad")
+    merge_out_of_core([path_a, path_b], out, join="inner")
+    merged = ad.read_h5ad(out)
+    assert merged.n_obs == _JOIN_N_CELLS * 2
+
+
+def test_layer_dropped_when_missing_from_shard(tmp_path: Path) -> None:
+    """A layer present in only one shard must be absent from the merged output."""
+    path_a = _make_shard(tmp_path, "A_layer", _JOIN_GENES_A, with_layer=True)
+    path_b = _make_shard(tmp_path, "B_nolayer", _JOIN_GENES_B, with_layer=False)
+    out = str(tmp_path / "no_layer.h5ad")
+    merge_out_of_core([path_a, path_b], out)
+    merged = ad.read_h5ad(out)
+    assert "counts" not in merged.layers
+
+
+def test_identical_var_fast_path_unchanged(tmp_path: Path) -> None:
+    """When all shards share the same var, the merged X must be bit-identical to a simple concat."""
+    path_a = _make_shard(tmp_path, "id_A", _JOIN_GENES_A)
+    path_b = _make_shard(tmp_path, "id_B", _JOIN_GENES_A)  # same genes as A
+    out = str(tmp_path / "identity.h5ad")
+    merge_out_of_core([path_a, path_b], out)
+    merged = ad.read_h5ad(out)
+    assert merged.n_vars == len(_JOIN_GENES_A)
+    adata_a = ad.read_h5ad(path_a)
+    adata_b = ad.read_h5ad(path_b)
+    expected = np.vstack([_to_dense(adata_a.X), _to_dense(adata_b.X)])
+    np.testing.assert_array_equal(_to_dense(merged.X), expected)
+
+
+def test_invalid_join_raises(tmp_path: Path) -> None:
+    path_a = _make_shard(tmp_path, "inv_A", _JOIN_GENES_A)
+    out = str(tmp_path / "bad.h5ad")
+    with pytest.raises(ValueError, match="join must be"):
+        merge_out_of_core([path_a], out, join="left")
+
+
+# ---------------------------------------------------------------------------
+# CLI glob expansion test
+# ---------------------------------------------------------------------------
+
+
+def test_cli_glob_expansion(tmp_path: Path) -> None:
+    """CLI _run() expands glob patterns and passes expanded list to merge."""
+    import argparse
+
+    from annslicer.merge import _run
+
+    _make_shard(tmp_path, "glob_shard_001", _JOIN_GENES_A)
+    _make_shard(tmp_path, "glob_shard_002", _JOIN_GENES_A)
+
+    out = str(tmp_path / "glob_merged.h5ad")
+    pattern = str(tmp_path / "glob_shard_*.h5ad")
+
+    args = argparse.Namespace(input_files=[pattern], output_file=out, join="outer")
+    _run(args)
+
+    merged = ad.read_h5ad(out)
+    assert merged.n_obs == _JOIN_N_CELLS * 2
+    assert merged.n_vars == len(_JOIN_GENES_A)
+
+
+def test_cli_glob_no_match_exits(tmp_path: Path) -> None:
+    """CLI _run() calls sys.exit when a pattern matches no files."""
+    import argparse
+
+    from annslicer.merge import _run
+
+    out = str(tmp_path / "nowhere.h5ad")
+    args = argparse.Namespace(
+        input_files=[str(tmp_path / "nonexistent_*.h5ad")],
+        output_file=out,
+        join="outer",
+    )
+    with pytest.raises(SystemExit):
+        _run(args)

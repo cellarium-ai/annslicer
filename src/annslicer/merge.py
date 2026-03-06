@@ -18,11 +18,135 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _compute_merged_var(
+    var_frames: list[pd.DataFrame], join: str
+) -> tuple[pd.DataFrame, list[np.ndarray], bool]:
+    """Compute the merged var DataFrame and per-shard column remaps.
+
+    Parameters
+    ----------
+    var_frames:
+        var DataFrames, one per shard, in shard order.
+    join:
+        ``"inner"`` or ``"outer"``.
+
+    Returns
+    -------
+    merged_var : pd.DataFrame
+        The merged var DataFrame (index is the merged gene set).
+    col_remaps : list of np.ndarray
+        ``col_remaps[i][j]`` is the column index in *merged_var* for gene *j*
+        of shard *i*.  For an inner join this may be ``-1`` for genes outside
+        the intersection; for an outer join every value is ``≥ 0``.
+    is_identity : bool
+        ``True`` when all shards share the identical var (fast path — no
+        remapping required).
+    """
+    from functools import reduce
+
+    indices = [df.index for df in var_frames]
+
+    # Fast path: every shard has the same var in the same order.
+    if all(idx.equals(indices[0]) for idx in indices[1:]):
+        identity = np.arange(len(indices[0]), dtype=np.int32)
+        return var_frames[0], [identity] * len(var_frames), True
+
+    if join == "inner":
+        merged_index = reduce(lambda a, b: a.intersection(b), indices)
+    else:  # outer
+        merged_index = reduce(lambda a, b: a.union(b), indices)
+
+    if len(merged_index) == 0:
+        raise ValueError(
+            f"The {join!r} join of var indices resulted in an empty var. "
+            "Check that your shards share at least one gene in common."
+        )
+
+    # Build merged var DataFrame: reindex the first shard's columns.
+    merged_var = var_frames[0].reindex(merged_index)
+
+    # get_indexer returns -1 for genes not present in merged_index (inner join
+    # only — outer join is a union so every gene is always found).
+    col_remaps = [merged_index.get_indexer(df.index).astype(np.int32) for df in var_frames]
+    return merged_var, col_remaps, False
+
+
+def _write_remapped_sparse(
+    out_store: object,
+    in_store: object,
+    path: str,
+    remap: np.ndarray,
+    is_identity: bool,
+    join: str,
+    current_nnz: int,
+    current_cell: int,
+    num_cells: int,
+) -> int:
+    """Stream one shard's sparse CSR data with optional column remapping.
+
+    Returns the updated ``current_nnz`` pointer.
+    """
+    old_data = in_store[path]["data"][:]  # type: ignore[index]
+    old_indices = in_store[path]["indices"][:]  # type: ignore[index]
+    old_indptr = in_store[path]["indptr"][:]  # type: ignore[index]
+
+    if is_identity:
+        shard_nnz = len(old_data)
+        out_store[path]["data"][current_nnz : current_nnz + shard_nnz] = old_data  # type: ignore[index]
+        out_store[path]["indices"][current_nnz : current_nnz + shard_nnz] = old_indices  # type: ignore[index]
+        shifted_indptr = old_indptr + current_nnz
+        out_store[path]["indptr"][current_cell : current_cell + num_cells] = shifted_indptr[:-1]  # type: ignore[index]
+        return current_nnz + shard_nnz
+
+    new_indices = remap[old_indices]
+
+    if join == "outer":
+        # All entries are kept; only column positions change.
+        shard_nnz = len(old_data)
+        out_store[path]["data"][current_nnz : current_nnz + shard_nnz] = old_data  # type: ignore[index]
+        out_store[path]["indices"][current_nnz : current_nnz + shard_nnz] = new_indices  # type: ignore[index]
+        shifted_indptr = old_indptr + current_nnz
+        out_store[path]["indptr"][current_cell : current_cell + num_cells] = shifted_indptr[:-1]  # type: ignore[index]
+        return current_nnz + shard_nnz
+
+    # Inner join: drop entries for genes absent from the intersection.
+    mask = new_indices >= 0
+    surviving_data = old_data[mask]
+    surviving_indices = new_indices[mask]
+
+    # Recompute indptr: count survivors per row then cumsum.
+    row_nnz = np.diff(old_indptr)  # shape: (num_cells,)
+    if len(old_data) > 0:
+        row_idx = np.repeat(np.arange(num_cells, dtype=np.int32), row_nnz)
+        new_row_nnz = np.bincount(row_idx[mask], minlength=num_cells)
+    else:
+        new_row_nnz = np.zeros(num_cells, dtype=np.int64)
+
+    new_local_indptr = np.concatenate([[0], np.cumsum(new_row_nnz)])
+    shard_surviving = int(mask.sum())
+
+    out_store[path]["data"][current_nnz : current_nnz + shard_surviving] = surviving_data  # type: ignore[index]
+    out_store[path]["indices"][current_nnz : current_nnz + shard_surviving] = surviving_indices  # type: ignore[index]
+    out_store[path]["indptr"][current_cell : current_cell + num_cells] = (  # type: ignore[index]
+        new_local_indptr[:-1] + current_nnz
+    )
+    return current_nnz + shard_surviving
+
+
+# ---------------------------------------------------------------------------
 # Main merge function
 # ---------------------------------------------------------------------------
 
 
-def merge_out_of_core(input_files: list[str], output_file: str) -> None:
+def merge_out_of_core(
+    input_files: list[str],
+    output_file: str,
+    join: str = "outer",
+) -> None:
     """
     Merge multiple sharded .h5ad or .zarr files into a single large file
     using minimal RAM.
@@ -37,7 +161,15 @@ def merge_out_of_core(input_files: list[str], output_file: str) -> None:
     output_file:
         Destination path for the merged file (.h5ad or .zarr).
         The format is inferred from the file extension.
+    join:
+        How to join the var (gene) axes when files differ.
+        ``"outer"`` (default) takes the union of all gene sets and fills
+        missing entries with zeros.  ``"inner"`` keeps only genes present in
+        every shard.  Layers absent from any shard are always dropped.
     """
+    if join not in ("inner", "outer"):
+        raise ValueError(f"join must be 'inner' or 'outer', got {join!r}")
+
     is_zarr = output_file.endswith(".zarr")
     format_name = "Zarr" if is_zarr else "H5AD"
 
@@ -50,31 +182,43 @@ def merge_out_of_core(input_files: list[str], output_file: str) -> None:
     # -----------------------------------------------------------------------
     logger.info("Phase 1: Building the metadata skeleton (%s format)...", format_name)
 
-    store_first = open_store(input_files[0], "r")
-    try:
-        var: pd.DataFrame = read_elem(store_first["var"])
-        uns: dict = read_elem(store_first["uns"]) if "uns" in store_first else {}
-        num_genes: int = var.shape[0]
-    finally:
-        if hasattr(store_first, "close"):
-            store_first.close()
-
+    var_frames: list[pd.DataFrame] = []
     obs_list: list[pd.DataFrame] = []
+    layer_keys_per_shard: list[set[str]] = []
     total_cells: int = 0
 
     for f in input_files:
         store = open_store(f, "r")
         try:
-            obs: pd.DataFrame = read_elem(store["obs"])
-            obs_list.append(obs)
-            total_cells += obs.shape[0]
+            var_frames.append(read_elem(store["var"]))
+            obs_df: pd.DataFrame = read_elem(store["obs"])
+            obs_list.append(obs_df)
+            total_cells += obs_df.shape[0]
+            layer_keys_per_shard.append(
+                set(store["layers"].keys()) if "layers" in store else set()
+            )
         finally:
             if hasattr(store, "close"):
                 store.close()
 
-    merged_obs = pd.concat(obs_list, axis=0)
+    store_first = open_store(input_files[0], "r")
+    try:
+        uns: dict = read_elem(store_first["uns"]) if "uns" in store_first else {}
+    finally:
+        if hasattr(store_first, "close"):
+            store_first.close()
 
-    skeleton = ad.AnnData(obs=merged_obs, var=var, uns=uns)
+    merged_var, col_remaps, is_identity = _compute_merged_var(var_frames, join)
+    num_genes: int = len(merged_var)
+
+    # Only merge layers present in *every* shard; absent layers would produce
+    # an inconsistent indptr and corrupt the output CSR matrix.
+    active_layers: set[str] = (
+        set.intersection(*layer_keys_per_shard) if layer_keys_per_shard else set()
+    )
+
+    merged_obs = pd.concat(obs_list, axis=0)
+    skeleton = ad.AnnData(obs=merged_obs, var=merged_var, uns=uns)
     if is_zarr:
         skeleton.write_zarr(output_file)
     else:
@@ -93,7 +237,7 @@ def merge_out_of_core(input_files: list[str], output_file: str) -> None:
     x_is_sparse: bool | None = None  # determined from first shard that has X
     x_dtype: np.dtype = np.dtype(np.float32)
 
-    for f in input_files:
+    for i, f in enumerate(input_files):
         store = open_store(f, "r")
         try:
             if "X" in store:
@@ -102,13 +246,26 @@ def merge_out_of_core(input_files: list[str], output_file: str) -> None:
                     if not x_is_sparse:
                         x_dtype = store["X"].dtype  # type: ignore[union-attr]
                 if x_is_sparse:
-                    matrix_nnz["X"] = matrix_nnz.get("X", 0) + store["X"]["data"].shape[0]
+                    if join == "inner" and not is_identity:
+                        old_idx = store["X"]["indices"][:]
+                        shard_nnz = int((col_remaps[i][old_idx] >= 0).sum())
+                    else:
+                        shard_nnz = int(store["X"]["data"].shape[0])
+                    matrix_nnz["X"] = matrix_nnz.get("X", 0) + shard_nnz
 
-            if "layers" in store:
-                for layer in store["layers"].keys():
-                    lpath = f"layers/{layer}"
-                    if _is_sparse_group(store, lpath):
-                        layer_nnz[layer] = layer_nnz.get(layer, 0) + store[lpath]["data"].shape[0]
+            for layer in active_layers:
+                lpath = f"layers/{layer}"
+                if (
+                    "layers" in store
+                    and layer in store["layers"]
+                    and _is_sparse_group(store, lpath)
+                ):
+                    if join == "inner" and not is_identity:
+                        old_idx = store[lpath]["indices"][:]
+                        lnnz = int((col_remaps[i][old_idx] >= 0).sum())
+                    else:
+                        lnnz = int(store[lpath]["data"].shape[0])
+                    layer_nnz[layer] = layer_nnz.get(layer, 0) + lnnz
 
             if "obsm" in store:
                 for key in store["obsm"].keys():
@@ -186,6 +343,7 @@ def merge_out_of_core(input_files: list[str], output_file: str) -> None:
 
     for i, (f, obs_df) in enumerate(zip(input_files, obs_list, strict=True)):
         num_cells_in_shard = obs_df.shape[0]
+        remap = col_remaps[i]
         logger.info(
             "Merging shard %d/%d: %s (%d cells)",
             i + 1,
@@ -198,41 +356,50 @@ def merge_out_of_core(input_files: list[str], output_file: str) -> None:
         try:
             # Stream X
             if "X" in matrix_nnz and "X" in in_store and _is_sparse_group(in_store, "X"):
-                shard_nnz = in_store["X"]["data"].shape[0]
-                out_store["X"]["data"][current_nnz_X : current_nnz_X + shard_nnz] = in_store["X"][
-                    "data"
-                ][:]
-                out_store["X"]["indices"][current_nnz_X : current_nnz_X + shard_nnz] = in_store[
-                    "X"
-                ]["indices"][:]
-                shifted_indptr = in_store["X"]["indptr"][:] + current_nnz_X
-                out_store["X"]["indptr"][current_cell : current_cell + num_cells_in_shard] = (
-                    shifted_indptr[:-1]
+                current_nnz_X = _write_remapped_sparse(
+                    out_store,
+                    in_store,
+                    "X",
+                    remap,
+                    is_identity,
+                    join,
+                    current_nnz_X,
+                    current_cell,
+                    num_cells_in_shard,
                 )
-                current_nnz_X += shard_nnz
             elif x_is_sparse is False and "X" in in_store:
-                out_store["X"][current_cell : current_cell + num_cells_in_shard, :] = in_store[
-                    "X"
-                ][:]
+                shard_X = in_store["X"][:]
+                if is_identity:
+                    out_store["X"][current_cell : current_cell + num_cells_in_shard, :] = shard_X
+                elif join == "inner":
+                    valid = remap >= 0
+                    out_store["X"][  # type: ignore[index]
+                        current_cell : current_cell + num_cells_in_shard, remap[valid]
+                    ] = shard_X[:, valid]
+                else:
+                    out_store["X"][  # type: ignore[index]
+                        current_cell : current_cell + num_cells_in_shard, remap
+                    ] = shard_X
 
             # Stream layers
-            if "layers" in in_store:
-                for layer in layer_nnz:
-                    lpath = f"layers/{layer}"
-                    if layer in in_store["layers"] and _is_sparse_group(in_store, lpath):
-                        shard_nnz = in_store[lpath]["data"].shape[0]
-                        start_nnz = current_nnz_layers[layer]
-                        out_store[lpath]["data"][start_nnz : start_nnz + shard_nnz] = in_store[
-                            lpath
-                        ]["data"][:]
-                        out_store[lpath]["indices"][start_nnz : start_nnz + shard_nnz] = in_store[
-                            lpath
-                        ]["indices"][:]
-                        shifted_indptr = in_store[lpath]["indptr"][:] + start_nnz
-                        out_store[lpath]["indptr"][
-                            current_cell : current_cell + num_cells_in_shard
-                        ] = shifted_indptr[:-1]
-                        current_nnz_layers[layer] += shard_nnz
+            for layer in layer_nnz:
+                lpath = f"layers/{layer}"
+                if (
+                    "layers" in in_store
+                    and layer in in_store["layers"]
+                    and _is_sparse_group(in_store, lpath)
+                ):
+                    current_nnz_layers[layer] = _write_remapped_sparse(
+                        out_store,
+                        in_store,
+                        lpath,
+                        remap,
+                        is_identity,
+                        join,
+                        current_nnz_layers[layer],
+                        current_cell,
+                        num_cells_in_shard,
+                    )
 
             # Stream obsm
             if "obsm" in in_store:
@@ -289,11 +456,29 @@ def register_subcommand(subparsers: argparse._SubParsersAction[argparse.Argument
     p.add_argument(
         "input_files",
         nargs="+",
-        help="Input shard files to merge, in order.",
+        help=(
+            "Input shard files or glob patterns to merge, in order. "
+            "Glob patterns are expanded lexicographically."
+        ),
+    )
+    p.add_argument(
+        "--join",
+        choices=["inner", "outer"],
+        default="outer",
+        help="How to join var (gene) axes when files differ (default: outer).",
     )
     p.set_defaults(func=_run)
 
 
 def _run(args: argparse.Namespace) -> None:
     """Dispatch function called by the CLI after argument parsing."""
-    merge_out_of_core(args.input_files, args.output_file)
+    import glob as _glob_mod
+    import sys
+
+    expanded: list[str] = []
+    for pattern in args.input_files:
+        matches = sorted(_glob_mod.glob(pattern))
+        if not matches:
+            sys.exit(f"error: no files matched pattern: {pattern!r}")
+        expanded.extend(matches)
+    merge_out_of_core(expanded, args.output_file, join=args.join)
