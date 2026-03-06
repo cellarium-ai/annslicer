@@ -16,6 +16,42 @@ from annslicer._store import _require_zarr
 logger = logging.getLogger(__name__)
 
 
+def _open_zarr_backed(input_file: str) -> ad.AnnData:
+    """
+    Open a zarr store in a backed-like mode without loading matrix data into RAM.
+
+    X and sparse layers are wrapped as ``CSRDataset`` objects that support
+    out-of-core slice and fancy indexing.  Small metadata (obs, var, obsm,
+    uns, etc.) is loaded eagerly since it must fit in memory anyway.
+    """
+    from anndata.io import read_elem, sparse_dataset
+
+    zarr_mod = _require_zarr()
+    group = zarr_mod.open(input_file, mode="r")  # type: ignore[attr-defined]
+
+    def _lazy_or_dense(grp, key: str) -> Any:
+        """Return a CSRDataset if the key holds a sparse group, else read_elem."""
+        try:
+            return sparse_dataset(grp[key])
+        except Exception:
+            return read_elem(grp[key])
+
+    layers: dict[str, Any] = (
+        {k: _lazy_or_dense(group["layers"], k) for k in group["layers"]}
+        if "layers" in group
+        else {}
+    )
+
+    return ad.AnnData(
+        X=_lazy_or_dense(group, "X"),
+        **{
+            k: read_elem(group[k]) if k in group else {}
+            for k in ["obs", "var", "obsm", "varm", "uns", "obsp", "varp"]
+        },
+        layers=layers,
+    )
+
+
 def shard_h5ad(
     input_file: str,
     output_prefix: str,
@@ -26,12 +62,13 @@ def shard_h5ad(
     """
     Shard a large .h5ad or .zarr file into smaller files using minimal RAM.
 
-    Uses AnnData backed-mode reading for .h5ad inputs, delegating all row
-    access to h5py's native indexing (which handles both dense and sparse CSR
-    matrices efficiently for sequential and shuffled access).
+    For .h5ad inputs, uses AnnData backed-mode reading so h5py streams each
+    shard's rows without loading the full matrix into memory.
 
-    For .zarr inputs the store is read fully into memory before sharding,
-    since AnnData does not support backed-mode for zarr.
+    For .zarr inputs, uses :func:`_open_zarr_backed` which wraps X and sparse
+    layers as ``CSRDataset`` objects (``anndata.io.sparse_dataset``), giving
+    the same out-of-core behaviour without requiring backed-mode support in
+    AnnData's zarr reader.
 
     Parameters
     ----------
@@ -39,7 +76,7 @@ def shard_h5ad(
         Path to the source .h5ad or .zarr file.
     output_prefix:
         Prefix for output shard filenames, e.g. ``"dataset"`` produces
-        ``dataset_shard001.h5ad``, ``dataset_shard002.h5ad``, etc.
+        ``dataset_shard_0.h5ad``, ``dataset_shard_1.h5ad``, etc.
     shard_size:
         Number of cells (rows) per shard. Defaults to 10 000.
     shuffle:
@@ -51,9 +88,8 @@ def shard_h5ad(
         ``shuffle=True``.  Ignored when ``shuffle=False``.
     """
     if input_file.endswith(".zarr"):
-        _require_zarr()
-        logger.info("Opening zarr store %s (reads fully into memory)...", input_file)
-        adata = ad.read_zarr(input_file)
+        logger.info("Opening zarr store %s in backed mode via sparse_dataset...", input_file)
+        adata = _open_zarr_backed(input_file)
     else:
         logger.info("Opening %s in backed mode...", input_file)
         adata = ad.read_h5ad(input_file, backed="r")
@@ -96,7 +132,7 @@ def _shard_store(
 
     for start_idx in range(0, total_cells, shard_size):
         end_idx = min(start_idx + shard_size, total_cells)
-        shard_num = (start_idx // shard_size) + 1
+        shard_num = (start_idx // shard_size)
         out_filename = f"{output_prefix}_shard_{shard_num}.h5ad"
         logger.info("  Writing %s (cells %d–%d)...", out_filename, start_idx, end_idx)
 

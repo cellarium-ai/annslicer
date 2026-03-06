@@ -8,7 +8,9 @@ import math
 from pathlib import Path
 
 import anndata as ad
+import numpy as np
 import pytest
+import scipy.sparse as sp
 
 from annslicer.merge import merge_out_of_core
 from annslicer.slice import shard_h5ad
@@ -161,3 +163,58 @@ def test_merge_zarr_requires_zarr_installed(
     # Just check it doesn't raise ImportError
     merge_out_of_core(sliced_shards, out_path)
     assert Path(out_path).exists()
+
+
+# ---------------------------------------------------------------------------
+# Zarr slice → merge round-trip tests
+# ---------------------------------------------------------------------------
+
+
+def _to_dense(arr) -> np.ndarray:
+    return arr.toarray() if sp.issparse(arr) else np.asarray(arr)
+
+
+def test_zarr_slice_merge_roundtrip(synthetic_zarr: str, tmp_path) -> None:
+    """Slice zarr → h5ad shards → merge back to zarr preserves all data."""
+    pytest.importorskip("zarr", reason="zarr not installed")
+
+    prefix = str(tmp_path / "sliced")
+    shard_h5ad(synthetic_zarr, prefix, shard_size=SHARD_SIZE)
+    shards = sorted(str(p) for p in tmp_path.glob("sliced_shard*.h5ad"))
+
+    out_zarr = str(tmp_path / "merged.zarr")
+    merge_out_of_core(shards, out_zarr)
+
+    original = ad.read_zarr(synthetic_zarr)
+    merged = ad.read_zarr(out_zarr)
+
+    assert list(merged.obs_names) == list(original.obs_names)
+    assert list(merged.var_names) == list(original.var_names)
+    np.testing.assert_array_almost_equal(_to_dense(merged.X), _to_dense(original.X))
+    np.testing.assert_array_almost_equal(
+        _to_dense(merged.layers["counts"]), _to_dense(original.layers["counts"])
+    )
+    np.testing.assert_array_almost_equal(merged.obsm["X_pca"], original.obsm["X_pca"])
+
+
+def test_zarr_slice_merge_to_h5ad(synthetic_zarr: str, tmp_path) -> None:
+    """Zarr input → h5ad shards → merged h5ad demonstrates format conversion."""
+    pytest.importorskip("zarr", reason="zarr not installed")
+
+    prefix = str(tmp_path / "sliced")
+    shard_h5ad(synthetic_zarr, prefix, shard_size=SHARD_SIZE)
+    shards = sorted(str(p) for p in tmp_path.glob("sliced_shard*.h5ad"))
+
+    out_h5ad = str(tmp_path / "merged.h5ad")
+    merge_out_of_core(shards, out_h5ad)
+
+    original = ad.read_zarr(synthetic_zarr)
+    merged = ad.read_h5ad(out_h5ad)
+
+    assert merged.n_obs == original.n_obs
+    assert merged.n_vars == original.n_vars
+    assert list(merged.obs_names) == list(original.obs_names)
+    assert list(merged.var_names) == list(original.var_names)
+    assert "counts" in merged.layers
+    assert "X_pca" in merged.obsm
+    np.testing.assert_array_almost_equal(_to_dense(merged.X), _to_dense(original.X))

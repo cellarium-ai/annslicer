@@ -10,7 +10,7 @@ import logging
 import anndata as ad
 import numpy as np
 import pandas as pd
-from anndata.experimental import read_elem
+from anndata.io import read_elem
 
 from annslicer._store import _is_sparse_group, _require_zarr, open_store
 
@@ -90,18 +90,19 @@ def merge_out_of_core(input_files: list[str], output_file: str) -> None:
     matrix_nnz: dict[str, int] = {}
     layer_nnz: dict[str, int] = {}
     obsm_shapes: dict[str, int] = {}
+    x_is_sparse: bool | None = None  # determined from first shard that has X
+    x_dtype: np.dtype = np.dtype(np.float32)
 
     for f in input_files:
         store = open_store(f, "r")
         try:
             if "X" in store:
-                if _is_sparse_group(store, "X"):
+                if x_is_sparse is None:
+                    x_is_sparse = _is_sparse_group(store, "X")
+                    if not x_is_sparse:
+                        x_dtype = store["X"].dtype  # type: ignore[union-attr]
+                if x_is_sparse:
                     matrix_nnz["X"] = matrix_nnz.get("X", 0) + store["X"]["data"].shape[0]
-                else:
-                    x_ds = store["X"]
-                    matrix_nnz["X"] = matrix_nnz.get("X", 0) + int(
-                        x_ds.shape[0] * x_ds.shape[1]  # type: ignore[index]
-                    )
 
             if "layers" in store:
                 for layer in store["layers"].keys():
@@ -143,6 +144,19 @@ def merge_out_of_core(input_files: list[str], output_file: str) -> None:
 
     if "X" in matrix_nnz:
         allocate_sparse("X", matrix_nnz["X"])
+    elif x_is_sparse is False:
+        # Dense X: allocate a plain 2-D dataset and stream row chunks.
+        if "X" in out_store:
+            del out_store["X"]
+        chunk_rows = min(total_cells, 1_000)
+        ds = out_store.create_dataset(
+            "X",
+            shape=(total_cells, num_genes),
+            chunks=(chunk_rows, num_genes),
+            dtype=x_dtype,
+        )
+        ds.attrs["encoding-type"] = "array"
+        ds.attrs["encoding-version"] = "0.2.0"
 
     if layer_nnz:
         layers_grp = out_store.require_group("layers")
@@ -196,6 +210,10 @@ def merge_out_of_core(input_files: list[str], output_file: str) -> None:
                     shifted_indptr[:-1]
                 )
                 current_nnz_X += shard_nnz
+            elif x_is_sparse is False and "X" in in_store:
+                out_store["X"][current_cell : current_cell + num_cells_in_shard, :] = in_store[
+                    "X"
+                ][:]
 
             # Stream layers
             if "layers" in in_store:
@@ -230,7 +248,7 @@ def merge_out_of_core(input_files: list[str], output_file: str) -> None:
 
         current_cell += num_cells_in_shard
 
-    # Cap off indptr arrays at total_cells position
+    # Cap off indptr arrays at total_cells position (sparse matrices only)
     if "X" in matrix_nnz:
         out_store["X"]["indptr"][total_cells] = current_nnz_X
     for layer, final_nnz in current_nnz_layers.items():

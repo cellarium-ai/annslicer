@@ -15,8 +15,8 @@ import pytest
 import scipy.sparse as sp
 
 # Adjust these to control benchmark scale.
-N_CELLS_BENCH = 100_000
-N_GENES_BENCH = 5_000
+N_CELLS_BENCH = 200_000
+N_GENES_BENCH = 10_000
 
 
 @pytest.fixture(scope="session")
@@ -85,3 +85,20 @@ def bench_output_dir(tmp_path_factory: pytest.TempPathFactory):
     out_dir = tmp_path_factory.getbasetemp() / "bench_shards"
     out_dir.mkdir(exist_ok=True)
     return out_dir
+
+
+@pytest.fixture(scope="session")
+def large_zarr(large_h5ad: str, tmp_path_factory: pytest.TempPathFactory) -> str:
+    """
+    Write the benchmark dataset as a .zarr store and return its path.
+
+    Re-uses the already-generated large_h5ad data so the two fixtures are
+    guaranteed to have identical contents, keeping h5ad vs zarr comparisons
+    apples-to-apples.  Skipped automatically if zarr is not installed.
+    """
+    pytest.importorskip("zarr", reason="zarr not installed; skipping zarr benchmarks")
+    adata = ad.read_h5ad(large_h5ad)
+    out_dir = tmp_path_factory.mktemp("bench_zarr_data")
+    zarr_path = str(out_dir / "large.zarr")
+    adata.write_zarr(zarr_path)
+    return zarr_path

@@ -142,7 +142,7 @@ def test_shuffle_reproducible_with_seed(synthetic_h5ad, tmp_path):
             synthetic_h5ad, str(tmp_path / run), shard_size=SHARD_SIZE, shuffle=True, seed=0
         )
 
-    for shard_n in range(1, math.ceil(N_CELLS / SHARD_SIZE) + 1):
+    for shard_n in range(0, math.ceil(N_CELLS / SHARD_SIZE)):
         p1 = tmp_path / f"run1_shard_{shard_n}.h5ad"
         p2 = tmp_path / f"run2_shard_{shard_n}.h5ad"
         a1 = ad.read_h5ad(p1)

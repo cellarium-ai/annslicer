@@ -24,7 +24,7 @@ import tracemalloc
 import anndata as ad
 import numpy as np
 
-from annslicer.slice import shard_h5ad
+from annslicer.slice import shard_h5ad, _open_zarr_backed
 
 BENCH_SHARD_SIZE = 10_000
 
@@ -58,8 +58,8 @@ def _backed_shard(input_file: str, output_prefix: str, shard_size: int) -> None:
 
     for start in range(0, total_cells, shard_size):
         end = min(start + shard_size, total_cells)
-        shard_num = (start // shard_size) + 1
-        out_path = f"{output_prefix}_shard{shard_num:03d}.h5ad"
+        shard_num = (start // shard_size)
+        out_path = f"{output_prefix}_shard_{shard_num}.h5ad"
 
         adata[start:end].to_memory().write_h5ad(out_path)
         # the following will be allowable after https://github.com/scverse/anndata/issues/2077
@@ -83,8 +83,8 @@ def _backed_shard_shuffle(input_file: str, output_prefix: str, shard_size: int, 
 
     for start in range(0, total_cells, shard_size):
         end = min(start + shard_size, total_cells)
-        shard_num = (start // shard_size) + 1
-        out_path = f"{output_prefix}_shard{shard_num:03d}.h5ad"
+        shard_num = (start // shard_size)
+        out_path = f"{output_prefix}_shard_{shard_num}.h5ad"
 
         adata[perm[start:end]].to_memory().write_h5ad(out_path)
         # the following will be allowable after https://github.com/scverse/anndata/issues/2077
@@ -107,7 +107,7 @@ def bench_annslicer_slice(benchmark, large_h5ad, bench_output_dir):
     (files are overwritten on every round, keeping disk usage bounded).
     """
     prefix = str(bench_output_dir / "shard")
-    benchmark.group = "sequential"
+    benchmark.group = "h5ad-sequential"
 
     peak_mb = _run_with_memory(shard_h5ad, large_h5ad, prefix, BENCH_SHARD_SIZE)
 
@@ -127,7 +127,7 @@ def bench_anndata_backed_iterate(benchmark, large_h5ad, bench_output_dir):
     output files as bench_annslicer_slice, making the comparison apples-to-apples.
     """
     prefix = str(bench_output_dir / "shard")
-    benchmark.group = "sequential"
+    benchmark.group = "h5ad-sequential"
 
     peak_mb = _run_with_memory(_backed_shard, large_h5ad, prefix, BENCH_SHARD_SIZE)
 
@@ -153,7 +153,7 @@ def bench_annslicer_slice_shuffle(benchmark, large_h5ad, bench_output_dir):
     then permute in-memory to the desired random order before writing.
     """
     prefix = str(bench_output_dir / "shard")
-    benchmark.group = "shuffle"
+    benchmark.group = "h5ad-shuffle"
 
     peak_mb = _run_with_memory(
         shard_h5ad, large_h5ad, prefix, BENCH_SHARD_SIZE, shuffle=True, seed=0
@@ -176,7 +176,7 @@ def bench_anndata_backed_shuffle(benchmark, large_h5ad, bench_output_dir):
     Writes the same .h5ad output files for a fair comparison.
     """
     prefix = str(bench_output_dir / "shard")
-    benchmark.group = "shuffle"
+    benchmark.group = "h5ad-shuffle"
 
     peak_mb = _run_with_memory(_backed_shard_shuffle, large_h5ad, prefix, BENCH_SHARD_SIZE, 0)
 
@@ -186,3 +186,118 @@ def bench_anndata_backed_shuffle(benchmark, large_h5ad, bench_output_dir):
     benchmark(_fn)
     benchmark.extra_info["peak_memory_MiB"] = round(peak_mb, 1)
     print(f"\n  [backed/shuffle]    peak RAM: {peak_mb:.1f} MiB")
+
+
+# ---------------------------------------------------------------------------
+# Zarr baselines
+# ---------------------------------------------------------------------------
+
+
+def _backed_zarr_shard(input_file: str, output_prefix: str, shard_size: int) -> None:
+    """
+    Backed-AnnData equivalent of shard_h5ad for zarr input (no shuffle).
+
+    Zarr has no backed mode, so this reads the entire store into memory
+    upfront — the inevitable cost any AnnData user would pay — then slices
+    and writes shards just as the h5ad baseline does.
+    """
+    adata = _open_zarr_backed(input_file)
+    total_cells = adata.n_obs
+
+    for start in range(0, total_cells, shard_size):
+        end = min(start + shard_size, total_cells)
+        shard_num = (start // shard_size)
+        out_path = f"{output_prefix}_shard_{shard_num}.h5ad"
+        adata[start:end].to_memory().write_h5ad(out_path)
+
+
+def _backed_zarr_shard_shuffle(
+    input_file: str, output_prefix: str, shard_size: int, seed: int
+) -> None:
+    """
+    Backed-AnnData equivalent of shard_h5ad(shuffle=True) for zarr input.
+
+    Reads the entire zarr store into memory then applies a global permutation.
+    Since data is already in RAM, no sort-read-reorder optimisation is needed.
+    """
+    adata = _open_zarr_backed(input_file)
+    total_cells = adata.n_obs
+    perm = np.random.default_rng(seed).permutation(total_cells)
+
+    for start in range(0, total_cells, shard_size):
+        end = min(start + shard_size, total_cells)
+        shard_num = (start // shard_size)
+        out_path = f"{output_prefix}_shard_{shard_num}.h5ad"
+        adata[perm[start:end]].to_memory().write_h5ad(out_path)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark pair 3: zarr sequential sharding
+# ---------------------------------------------------------------------------
+
+
+def bench_annslicer_zarr_slice(benchmark, large_zarr, bench_output_dir):
+    """annslicer — sequential sharding from a zarr store."""
+    prefix = str(bench_output_dir / "shard")
+    benchmark.group = "zarr-sequential"
+
+    peak_mb = _run_with_memory(shard_h5ad, large_zarr, prefix, BENCH_SHARD_SIZE)
+
+    def _fn():
+        shard_h5ad(large_zarr, prefix, BENCH_SHARD_SIZE)
+
+    benchmark(_fn)
+    benchmark.extra_info["peak_memory_MiB"] = round(peak_mb, 1)
+    print(f"\n  [annslicer/zarr]    peak RAM: {peak_mb:.1f} MiB")
+
+
+def bench_anndata_zarr_backed_iterate(benchmark, large_zarr, bench_output_dir):
+    """Baseline — read_zarr + AnnData sequential sharding."""
+    prefix = str(bench_output_dir / "shard")
+    benchmark.group = "zarr-sequential"
+
+    peak_mb = _run_with_memory(_backed_zarr_shard, large_zarr, prefix, BENCH_SHARD_SIZE)
+
+    def _fn():
+        _backed_zarr_shard(large_zarr, prefix, BENCH_SHARD_SIZE)
+
+    benchmark(_fn)
+    benchmark.extra_info["peak_memory_MiB"] = round(peak_mb, 1)
+    print(f"\n  [backed/zarr]       peak RAM: {peak_mb:.1f} MiB")
+
+
+# ---------------------------------------------------------------------------
+# Benchmark pair 4: zarr shuffled sharding
+# ---------------------------------------------------------------------------
+
+
+def bench_annslicer_zarr_slice_shuffle(benchmark, large_zarr, bench_output_dir):
+    """annslicer — shuffled sharding from a zarr store."""
+    prefix = str(bench_output_dir / "shard")
+    benchmark.group = "zarr-shuffle"
+
+    peak_mb = _run_with_memory(
+        shard_h5ad, large_zarr, prefix, BENCH_SHARD_SIZE, shuffle=True, seed=0
+    )
+
+    def _fn():
+        shard_h5ad(large_zarr, prefix, BENCH_SHARD_SIZE, shuffle=True, seed=0)
+
+    benchmark(_fn)
+    benchmark.extra_info["peak_memory_MiB"] = round(peak_mb, 1)
+    print(f"\n  [annslicer/zarr-s]  peak RAM: {peak_mb:.1f} MiB")
+
+
+def bench_anndata_zarr_backed_shuffle(benchmark, large_zarr, bench_output_dir):
+    """Baseline — read_zarr + AnnData shuffled sharding."""
+    prefix = str(bench_output_dir / "shard")
+    benchmark.group = "zarr-shuffle"
+
+    peak_mb = _run_with_memory(_backed_zarr_shard_shuffle, large_zarr, prefix, BENCH_SHARD_SIZE, 0)
+
+    def _fn():
+        _backed_zarr_shard_shuffle(large_zarr, prefix, BENCH_SHARD_SIZE, 0)
+
+    benchmark(_fn)
+    benchmark.extra_info["peak_memory_MiB"] = round(peak_mb, 1)
+    print(f"\n  [backed/zarr-s]     peak RAM: {peak_mb:.1f} MiB")
