@@ -24,7 +24,7 @@ import tracemalloc
 import anndata as ad
 import numpy as np
 
-from annslicer.slice import shard_h5ad, _open_zarr_backed
+from annslicer.slice import _open_zarr_backed, shard_h5ad
 
 BENCH_SHARD_SIZE = 10_000
 
@@ -58,7 +58,7 @@ def _backed_shard(input_file: str, output_prefix: str, shard_size: int) -> None:
 
     for start in range(0, total_cells, shard_size):
         end = min(start + shard_size, total_cells)
-        shard_num = (start // shard_size)
+        shard_num = start // shard_size
         out_path = f"{output_prefix}_shard_{shard_num}.h5ad"
 
         adata[start:end].to_memory().write_h5ad(out_path)
@@ -83,7 +83,7 @@ def _backed_shard_shuffle(input_file: str, output_prefix: str, shard_size: int, 
 
     for start in range(0, total_cells, shard_size):
         end = min(start + shard_size, total_cells)
-        shard_num = (start // shard_size)
+        shard_num = start // shard_size
         out_path = f"{output_prefix}_shard_{shard_num}.h5ad"
 
         adata[perm[start:end]].to_memory().write_h5ad(out_path)
@@ -206,7 +206,7 @@ def _backed_zarr_shard(input_file: str, output_prefix: str, shard_size: int) -> 
 
     for start in range(0, total_cells, shard_size):
         end = min(start + shard_size, total_cells)
-        shard_num = (start // shard_size)
+        shard_num = start // shard_size
         out_path = f"{output_prefix}_shard_{shard_num}.h5ad"
         adata[start:end].to_memory().write_h5ad(out_path)
 
@@ -226,7 +226,7 @@ def _backed_zarr_shard_shuffle(
 
     for start in range(0, total_cells, shard_size):
         end = min(start + shard_size, total_cells)
-        shard_num = (start // shard_size)
+        shard_num = start // shard_size
         out_path = f"{output_prefix}_shard_{shard_num}.h5ad"
         adata[perm[start:end]].to_memory().write_h5ad(out_path)
 

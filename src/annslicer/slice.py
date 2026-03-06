@@ -27,7 +27,7 @@ def _open_zarr_backed(input_file: str) -> ad.AnnData:
     from anndata.io import read_elem, sparse_dataset
 
     zarr_mod = _require_zarr()
-    group = zarr_mod.open(input_file, mode="r")  # type: ignore[attr-defined]
+    group = zarr_mod.open(input_file, mode="r")
 
     def _lazy_or_dense(grp, key: str) -> Any:
         """Return a CSRDataset if the key holds a sparse group, else read_elem."""
@@ -132,7 +132,7 @@ def _shard_store(
 
     for start_idx in range(0, total_cells, shard_size):
         end_idx = min(start_idx + shard_size, total_cells)
-        shard_num = (start_idx // shard_size)
+        shard_num = start_idx // shard_size
         out_filename = f"{output_prefix}_shard_{shard_num}.h5ad"
         logger.info("  Writing %s (cells %d–%d)...", out_filename, start_idx, end_idx)
 
