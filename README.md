@@ -1,10 +1,10 @@
 # annslicer
 
-**Out-of-core sharding and merging of large `.h5ad` AnnData files with minimal memory usage.**
+**Out-of-core sharding and merging of large AnnData files with minimal memory usage.**
 
 ![Diagram](diagram.png)
 
-Large single-cell datasets stored as `.h5ad` files can easily exceed available RAM. `annslicer` slices them into manageable shards — and merges them back — without loading full matrices into memory. It uses best practices from `anndata` with a few small speed improvements.
+Large single-cell datasets stored as `.h5ad` or `.zarr` files can easily exceed available RAM. `annslicer` slices them into manageable shards — and merges them back — without loading full matrices into memory. It uses best practices from `anndata` with a few small speed improvements for random shuffling.
 
 Consolidates best practices into a simple command-line tool.
 
