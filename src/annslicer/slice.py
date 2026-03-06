@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from typing import Any
 
 import anndata as ad
 import numpy as np
@@ -64,6 +65,11 @@ def shard_h5ad(
             adata.file.close()
 
 
+def _unwrap(arr: np.ndarray) -> Any:
+    """Unwrap the 0-d object array that h5py sometimes returns for backed sparse layers."""
+    return arr.item() if isinstance(arr, np.ndarray) and arr.ndim == 0 else arr
+
+
 def _shard_store(
     adata: ad.AnnData,
     output_prefix: str,
@@ -74,18 +80,16 @@ def _shard_store(
     """
     Core sharding loop operating on an already-opened AnnData object.
 
-    Each shard is written by indexing the AnnData with a row selector and
-    calling ``.write_h5ad()`` directly — AnnData handles X, obs, layers,
-    obsm, and uns in one shot, delegating I/O to h5py's native machinery.
-    This function is format-agnostic: the caller is responsible for opening
-    *adata* appropriately (backed h5ad or in-memory zarr).
+    Reads each shard directly via h5py slice/fancy indexing and constructs an
+    in-memory AnnData from the pieces before writing.  For shuffled output,
+    indices are sorted prior to reading (sequential I/O), then reordered in
+    memory into the target permutation order, avoiding random disk seeks.
     """
     total_cells = adata.n_obs
 
     perm: np.ndarray | None = None
     if shuffle:
-        rng = np.random.default_rng(seed)
-        perm = rng.permutation(total_cells)
+        perm = np.random.default_rng(seed).permutation(total_cells)
         logger.info("Shuffle enabled (seed=%s). Permutation generated.", seed)
 
     logger.info("Total cells: %d. Generating shards of %d...", total_cells, shard_size)
@@ -93,11 +97,32 @@ def _shard_store(
     for start_idx in range(0, total_cells, shard_size):
         end_idx = min(start_idx + shard_size, total_cells)
         shard_num = (start_idx // shard_size) + 1
-        out_filename = f"{output_prefix}_shard{shard_num:03d}.h5ad"
+        out_filename = f"{output_prefix}_shard_{shard_num}.h5ad"
         logger.info("  Writing %s (cells %d–%d)...", out_filename, start_idx, end_idx)
 
-        idx = perm[start_idx:end_idx] if perm is not None else slice(start_idx, end_idx)
-        adata[idx].to_memory().write_h5ad(out_filename)
+        if perm is not None:
+            orig_idx = perm[start_idx:end_idx]
+            sorted_idx = np.sort(orig_idx)
+            restore = np.argsort(np.argsort(orig_idx))
+            X = _unwrap(adata.X[sorted_idx, :])[restore]
+            layers = {k: _unwrap(adata.layers[k][sorted_idx, :])[restore] for k in adata.layers}
+            obsm = {k: np.asarray(adata.obsm[k][sorted_idx])[restore] for k in adata.obsm}
+            obs = adata.obs.iloc[orig_idx]
+        else:
+            s = slice(start_idx, end_idx)
+            X = _unwrap(adata.X[s, :])
+            layers = {k: _unwrap(adata.layers[k][s, :]) for k in adata.layers}
+            obsm = {k: np.asarray(adata.obsm[k][s]) for k in adata.obsm}
+            obs = adata.obs.iloc[start_idx:end_idx]
+
+        ad.AnnData(
+            X=X,
+            obs=obs.copy(),
+            var=adata.var.copy(),
+            obsm=obsm,
+            layers=layers,
+            uns=adata.uns.copy(),
+        ).write_h5ad(out_filename)
 
     logger.info("All shards successfully created.")
 

@@ -143,8 +143,8 @@ def test_shuffle_reproducible_with_seed(synthetic_h5ad, tmp_path):
         )
 
     for shard_n in range(1, math.ceil(N_CELLS / SHARD_SIZE) + 1):
-        p1 = tmp_path / f"run1_shard{shard_n:03d}.h5ad"
-        p2 = tmp_path / f"run2_shard{shard_n:03d}.h5ad"
+        p1 = tmp_path / f"run1_shard_{shard_n}.h5ad"
+        p2 = tmp_path / f"run2_shard_{shard_n}.h5ad"
         a1 = ad.read_h5ad(p1)
         a2 = ad.read_h5ad(p2)
         assert a1.obs_names.tolist() == a2.obs_names.tolist(), f"Shard {shard_n} differs"

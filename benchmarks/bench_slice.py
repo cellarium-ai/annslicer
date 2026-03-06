@@ -12,7 +12,8 @@ Pairs:
 Run with:
     pytest benchmarks/ --benchmark-only -v
 
-Peak RSS memory is captured via tracemalloc and reported in
+Peak memory is captured via tracemalloc's high-water mark
+(tracemalloc.get_traced_memory()[1]) and reported in
 benchmark.extra_info["peak_memory_MiB"] as well as printed to stdout.
 """
 
@@ -33,36 +34,15 @@ BENCH_SHARD_SIZE = 10_000
 # ---------------------------------------------------------------------------
 
 
-def _peak_mb(snapshot: tracemalloc.Snapshot) -> float:
-    """Return total bytes allocated (MiB) from a tracemalloc snapshot."""
-    return sum(s.size for s in snapshot.statistics("lineno")) / (1024**2)
-
-
-def _unwrap(arr):
-    """
-    Strip the 0-d numpy object-array wrapper that some anndata/h5py versions
-    return when fancy-indexing a backed sparse layer, without densifying.
-
-    Backed sparse layers can come back as ``array(<CSR matrix>, dtype=object)``
-    instead of the matrix itself.  Calling ``.item()`` recovers the actual
-    sparse (or dense) matrix so that downstream indexing works correctly and
-    sparsity is preserved — keeping the baseline fair against annslicer, which
-    also writes sparse layers to the shard files.
-    """
-    if isinstance(arr, np.ndarray) and arr.ndim == 0:
-        return arr.item()  # 0-d object array → contained sparse / dense matrix
-    return arr
-
-
 def _run_with_memory(fn, *args, **kwargs) -> float:
-    """Run *fn*, return peak Python heap allocation in MiB."""
+    """Run *fn*, return peak Python heap allocation in MiB (tracemalloc high-water mark)."""
     tracemalloc.start()
     try:
         fn(*args, **kwargs)
-        snapshot = tracemalloc.take_snapshot()
+        _, peak_bytes = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    return _peak_mb(snapshot)
+    return peak_bytes / (1024**2)
 
 
 def _backed_shard(input_file: str, output_prefix: str, shard_size: int) -> None:
@@ -81,21 +61,9 @@ def _backed_shard(input_file: str, output_prefix: str, shard_size: int) -> None:
         shard_num = (start // shard_size) + 1
         out_path = f"{output_prefix}_shard{shard_num:03d}.h5ad"
 
-        X_shard = _unwrap(adata.X[start:end, :])
-
-        layers_shard = {
-            name: _unwrap(adata.layers[name][start:end, :]) for name in adata.layers.keys()
-        }
-        obsm_shard = {k: np.asarray(adata.obsm[k][start:end]) for k in adata.obsm.keys()}
-
-        ad.AnnData(
-            X=X_shard,
-            obs=adata.obs.iloc[start:end].copy(),
-            var=adata.var.copy(),
-            obsm=obsm_shard,
-            layers=layers_shard,
-            uns=adata.uns.copy(),
-        ).write_h5ad(out_path)
+        adata[start:end].to_memory().write_h5ad(out_path)
+        # the following will be allowable after https://github.com/scverse/anndata/issues/2077
+        # adata[start:end].write_h5ad(out_path)
 
     adata.file.close()
 
@@ -118,31 +86,9 @@ def _backed_shard_shuffle(input_file: str, output_prefix: str, shard_size: int, 
         shard_num = (start // shard_size) + 1
         out_path = f"{output_prefix}_shard{shard_num:03d}.h5ad"
 
-        orig_indices = perm[start:end]
-        sorted_idx = np.sort(orig_indices)
-        restore_order = np.argsort(np.argsort(orig_indices))
-
-        X_shard = _unwrap(adata.X[sorted_idx, :])
-        X_shard = X_shard[restore_order]
-
-        layers_shard = {}
-        for name in adata.layers.keys():
-            arr = _unwrap(adata.layers[name][sorted_idx, :])
-            layers_shard[name] = arr[restore_order]  # sparse fancy-row indexing works on CSR
-
-        obsm_shard = {}
-        for k in adata.obsm.keys():
-            arr = np.asarray(adata.obsm[k][sorted_idx])
-            obsm_shard[k] = arr[restore_order]
-
-        ad.AnnData(
-            X=X_shard,
-            obs=adata.obs.iloc[orig_indices].copy(),
-            var=adata.var.copy(),
-            obsm=obsm_shard,
-            layers=layers_shard,
-            uns=adata.uns.copy(),
-        ).write_h5ad(out_path)
+        adata[perm[start:end]].to_memory().write_h5ad(out_path)
+        # the following will be allowable after https://github.com/scverse/anndata/issues/2077
+        # adata[start:end].write_h5ad(out_path)
 
     adata.file.close()
 
@@ -161,6 +107,7 @@ def bench_annslicer_slice(benchmark, large_h5ad, bench_output_dir):
     (files are overwritten on every round, keeping disk usage bounded).
     """
     prefix = str(bench_output_dir / "shard")
+    benchmark.group = "sequential"
 
     peak_mb = _run_with_memory(shard_h5ad, large_h5ad, prefix, BENCH_SHARD_SIZE)
 
@@ -180,6 +127,7 @@ def bench_anndata_backed_iterate(benchmark, large_h5ad, bench_output_dir):
     output files as bench_annslicer_slice, making the comparison apples-to-apples.
     """
     prefix = str(bench_output_dir / "shard")
+    benchmark.group = "sequential"
 
     peak_mb = _run_with_memory(_backed_shard, large_h5ad, prefix, BENCH_SHARD_SIZE)
 
@@ -205,6 +153,7 @@ def bench_annslicer_slice_shuffle(benchmark, large_h5ad, bench_output_dir):
     then permute in-memory to the desired random order before writing.
     """
     prefix = str(bench_output_dir / "shard")
+    benchmark.group = "shuffle"
 
     peak_mb = _run_with_memory(
         shard_h5ad, large_h5ad, prefix, BENCH_SHARD_SIZE, shuffle=True, seed=0
@@ -227,6 +176,7 @@ def bench_anndata_backed_shuffle(benchmark, large_h5ad, bench_output_dir):
     Writes the same .h5ad output files for a fair comparison.
     """
     prefix = str(bench_output_dir / "shard")
+    benchmark.group = "shuffle"
 
     peak_mb = _run_with_memory(_backed_shard_shuffle, large_h5ad, prefix, BENCH_SHARD_SIZE, 0)
 

@@ -15,8 +15,8 @@ import pytest
 import scipy.sparse as sp
 
 # Adjust these to control benchmark scale.
-N_CELLS_BENCH = 50_000
-N_GENES_BENCH = 2_000
+N_CELLS_BENCH = 100_000
+N_GENES_BENCH = 5_000
 
 
 @pytest.fixture(scope="session")
