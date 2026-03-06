@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "setuptools-scm>=8"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "annslicer"
@@ -30,14 +30,20 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "annslicer[zarr]",
     "pytest>=8.0",
+    "pytest-benchmark>=4.0",
     "ruff>=0.4",
+    "mypy==1.15.0",
     "build",
     "twine",
 ]
+zarr = [
+    "zarr>=2.10",
+]
 
 [project.scripts]
-annslice = "annslicer.core:main"
+annslicer = "annslicer.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/sfleming/annslicer"
@@ -50,6 +56,8 @@ Homepage = "https://github.com/sfleming/annslicer"
 # Writes src/annslicer/_version.py so the version is available at runtime
 # without requiring the package to be installed from PyPI.
 write_to = "src/annslicer/_version.py"
+# Used when no git tag is present (e.g. fresh clone before first release).
+fallback_version = "0.0.0.dev0"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -57,10 +65,30 @@ where = ["src"]
 # ---------------------------------------------------------------------------
 # Ruff — linter + formatter
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# mypy — static type checking
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_return_any = false
+
+# merge.py and _store.py use a dual h5py/zarr Store pattern that is structurally incompatible
+# with static type-checking without a complex Protocol; suppress errors there only.
+[[tool.mypy.overrides]]
+module = "annslicer.merge"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "annslicer._store"
+ignore_errors = true
+
 [tool.ruff]
 target-version = "py310"
 line-length = 99
 src = ["src", "tests"]
+exclude = ["src/annslicer/_version.py"]
 
 [tool.ruff.lint]
 # E/W: pycodestyle  F: Pyflakes  I: isort  UP: pyupgrade  B: flake8-bugbear
@@ -75,4 +103,7 @@ known-first-party = ["annslicer"]
 # ---------------------------------------------------------------------------
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# benchmarks/ is excluded from the default test run; use `make benchmark` instead.
 addopts = "-v"
+python_files = ["test_*.py", "bench_*.py"]
+python_functions = ["test_*", "bench_*"]
