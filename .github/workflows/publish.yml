@@ -21,6 +21,7 @@ jobs:
   build-and-publish:
     name: Build and publish to PyPI
     runs-on: ubuntu-latest
+    environment: pypi  # must match the environment name set in PyPI trusted publisher config
 
     # Required for PyPI Trusted Publishing (OIDC token exchange)
     permissions:
