@@ -2,7 +2,19 @@
 
 **Out-of-core sharding and merging of large `.h5ad` AnnData files with minimal memory usage.**
 
-Large single-cell datasets stored as `.h5ad` files can easily exceed available RAM. `annslicer` slices them into manageable shards — and merges them back — without loading full matrices into memory. It uses `h5py` directly to stream only the rows it needs from disk.
+![Diagram](diagram.png)
+
+Large single-cell datasets stored as `.h5ad` files can easily exceed available RAM. `annslicer` slices them into manageable shards — and merges them back — without loading full matrices into memory. It uses best practices from `anndata` with a few small speed improvements.
+
+Consolidates best practices into a simple command-line tool.
+
+```bash
+annslicer slice input.h5ad output_prefix
+```
+
+```bash
+annslicer merge output.h5ad shard_0.h5ad shard_1.h5ad
+```
 
 ## Features
 
@@ -52,24 +64,24 @@ Both `.h5ad` and `.zarr` inputs are supported.
 annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 20000
 ```
 
-**Example — shuffled sharding from a Zarr store:**
+**Example — shuffled sharding from a large h5ad:**
 
 ```bash
-annslicer slice /data/large_atlas.zarr /outputs/atlas --size 10000 --shuffle --seed 42
+annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 10000 --shuffle --seed 0
 ```
 
-Produces: `atlas_shard001.h5ad`, `atlas_shard002.h5ad`, …
+Produces: `atlas_shard_0.h5ad`, `atlas_shard_1.h5ad`, …
 
 ### Merging shards back into one file
 
 ```bash
-annslicer merge output.h5ad shard001.h5ad shard002.h5ad shard003.h5ad
+annslicer merge output.h5ad shard_0.h5ad shard_1.h5ad shard_2.h5ad
 ```
 
 Output format is inferred from the extension — use `.zarr` for Zarr output (requires `annslicer[zarr]`):
 
 ```bash
-annslicer merge output.zarr shard001.h5ad shard002.h5ad shard003.h5ad
+annslicer merge output.zarr shard_0.h5ad shard_1.h5ad shard_2.h5ad
 ```
 
 ### Global options
@@ -88,16 +100,16 @@ shard_h5ad("large_atlas.h5ad", "atlas", shard_size=20000)
 shard_h5ad("large_atlas.zarr", "atlas", shard_size=20000)  # requires annslicer[zarr]
 
 # Shuffled sharding — cells are randomly distributed across shards
-shard_h5ad("large_atlas.h5ad", "atlas", shard_size=20000, shuffle=True, seed=42)
+shard_h5ad("large_atlas.h5ad", "atlas", shard_size=20000, shuffle=True, seed=0)
 
 # Merge shards back into one file
-merge_out_of_core(["atlas_shard001.h5ad", "atlas_shard002.h5ad"], "merged.h5ad")
+merge_out_of_core(["atlas_shard_0.h5ad", "atlas_shard_1.h5ad"], "merged.h5ad")
 ```
 
 ## How it works
 
 ### Slicing
-1. Opens the input file for metadata (backed AnnData for `.h5ad`; `read_elem` for `.zarr`).
+1. Opens the input file ("backed" AnnData for `.h5ad`; `anndata.io.sparse_dataset` for `.zarr`).
 2. If `shuffle=True`, generates a global cell permutation upfront using `numpy.random.default_rng`.
 3. For each shard, reads only the relevant rows from `X` and each layer via sorted fancy indexing — no full matrix is ever loaded into memory.
 4. When shuffling, rows are read in sorted index order (maximising sequential I/O) and then reordered in-memory to the desired shuffled order.
@@ -109,6 +121,30 @@ merge_out_of_core(["atlas_shard001.h5ad", "atlas_shard002.h5ad"], "merged.h5ad")
 3. Streams `X`, layers, and `obsm` data shard-by-shard directly into the pre-allocated output arrays.
 
 > **Note:** CSC (column-compressed) sparse matrices are not supported for out-of-core row-slicing. Convert to CSR before sharding.
+
+## Benchmarks
+
+Run on a dummy sparse anndata object with 200k cells and 10k genes.
+
+### For h5ad format
+
+| Slicing method | Mean runtime (s) | Peak memory (MB) |
+|---|---|---|
+| `annslicer slice` | 0.584 | 211.4 |
+| `anndata` backed | 0.601 | 203.7 |
+| `annslicer slice --shuffle` | 1.731 | 221.8 |
+| `anndata` backed with shuffle | 3.830 | 209.1 |
+
+### For zarr format
+
+| Slicing method | Mean runtime (s) | Peak memory (MB) |
+|---|---|---|
+| `annslicer slice` | 1.050 | 62.1 |
+| `anndata` backed | 0.799 | 54.4 |
+| `annslicer slice --shuffle` | 5.544 | 142.9 |
+| `anndata` backed with shuffle | 6.591 | 151.4 |
+
+Based on these benchmarks, for making randomly shuffled data shards, we recommend using `annslicer slice --shuffle` on an h5ad format file.
 
 ## License
 
