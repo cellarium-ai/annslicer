@@ -1,14 +1,20 @@
 name: Publish to PyPI
 
-# Run this workflow manually from the Actions tab after tagging a release.
-# Before triggering:
+# Runs automatically when a GitHub Release is published, AND can be
+# triggered manually from the Actions tab as a fallback.
+#
+# Before creating a release:
 #   git tag v0.x.y
 #   git push --tags
+#   git push origin --tags
+# Then: GitHub → Releases → Draft a new release → choose the tag → Publish.
 #
 # PyPI Trusted Publishing (OIDC) is used — no API token stored in secrets.
 # One-time setup on PyPI: add a "Trusted Publisher" for this repo/workflow.
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
 
 jobs:
