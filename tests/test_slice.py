@@ -154,7 +154,7 @@ def test_shuffle_reproducible_with_seed(synthetic_h5ad, tmp_path):
         )
 
 
-def test_shuffle_different_seeds_differ(synthetic_h5ad, tmp_path):
+def test_shard_different_seeds_differ(synthetic_h5ad, tmp_path):
     """Different seeds produce different shuffles."""
     shard_h5ad(synthetic_h5ad, str(tmp_path / "s1"), shard_size=SHARD_SIZE, shuffle=True, seed=1)
     shard_h5ad(synthetic_h5ad, str(tmp_path / "s2"), shard_size=SHARD_SIZE, shuffle=True, seed=2)
@@ -162,6 +162,25 @@ def test_shuffle_different_seeds_differ(synthetic_h5ad, tmp_path):
     names1 = ad.read_h5ad(list(sorted(tmp_path.glob("s1_shard*.h5ad")))[0]).obs_names.tolist()
     names2 = ad.read_h5ad(list(sorted(tmp_path.glob("s2_shard*.h5ad")))[0]).obs_names.tolist()
     assert names1 != names2, "Different seeds should (almost certainly) produce different shuffles"
+
+
+# ---------------------------------------------------------------------------
+# Compression tests
+# ---------------------------------------------------------------------------
+
+
+def test_gzip_compression_produces_valid_shards(synthetic_h5ad, tmp_path):
+    """Shards written with compression='gzip' are valid and data-identical to uncompressed."""
+    prefix = str(tmp_path / "gzip")
+    shard_h5ad(synthetic_h5ad, prefix, shard_size=SHARD_SIZE, compression="gzip")
+
+    shard_paths = sorted(tmp_path.glob("gzip_shard*.h5ad"))
+    assert len(shard_paths) == math.ceil(N_CELLS / SHARD_SIZE)
+
+    for path in shard_paths:
+        adata = ad.read_h5ad(path)
+        assert adata.n_vars == N_GENES
+        assert "counts" in adata.layers
 
 
 # ---------------------------------------------------------------------------

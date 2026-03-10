@@ -57,6 +57,7 @@ Both `.h5ad` and `.zarr` inputs are supported.
 | `--size N` | Number of cells per shard (default: `10000`) |
 | `--shuffle` | Randomly assign cells to shards (each shard is a representative draw) |
 | `--seed N` | Random seed for reproducible shuffling (requires `--shuffle`) |
+| `--compression FILTER` | HDF5 compression filter for shard files (e.g. `gzip`, `lzf`); default: no compression |
 
 **Example — basic sharding:**
 
@@ -68,6 +69,12 @@ annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 20000
 
 ```bash
 annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 10000 --shuffle --seed 0
+```
+
+**Example — gzip-compressed shards:**
+
+```bash
+annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 10000 --compression gzip
 ```
 
 Produces: `atlas_shard_0.h5ad`, `atlas_shard_1.h5ad`, …
@@ -115,6 +122,9 @@ shard_h5ad("large_atlas.zarr", "atlas", shard_size=20000)  # requires annslicer[
 
 # Shuffled sharding — cells are randomly distributed across shards
 shard_h5ad("large_atlas.h5ad", "atlas", shard_size=20000, shuffle=True, seed=0)
+
+# Gzip-compressed shards — smaller files at the cost of write speed
+shard_h5ad("large_atlas.h5ad", "atlas", shard_size=20000, compression="gzip")
 
 # Merge shards back into one file (identical-var fast path used automatically)
 merge_out_of_core(["atlas_shard_0.h5ad", "atlas_shard_1.h5ad"], "merged.h5ad")

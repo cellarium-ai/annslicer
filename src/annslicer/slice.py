@@ -58,6 +58,7 @@ def shard_h5ad(
     shard_size: int = 10000,
     shuffle: bool = False,
     seed: int | None = None,
+    compression: str | None = None,
 ) -> None:
     """
     Shard a large .h5ad or .zarr file into smaller files using minimal RAM.
@@ -86,6 +87,10 @@ def shard_h5ad(
     seed:
         Random seed passed to :class:`numpy.random.Generator` when
         ``shuffle=True``.  Ignored when ``shuffle=False``.
+    compression:
+        HDF5 compression filter to use when writing shard ``.h5ad`` files,
+        e.g. ``"gzip"`` or ``"lzf"``.  ``None`` (default) writes
+        uncompressed files, which is fastest for downstream streaming reads.
     """
     if input_file.endswith(".zarr"):
         logger.info("Opening zarr store %s in backed mode via sparse_dataset...", input_file)
@@ -95,7 +100,7 @@ def shard_h5ad(
         adata = ad.read_h5ad(input_file, backed="r")
 
     try:
-        _shard_store(adata, output_prefix, shard_size, shuffle, seed)
+        _shard_store(adata, output_prefix, shard_size, shuffle, seed, compression)
     finally:
         if hasattr(adata, "file") and adata.file.is_open:
             adata.file.close()
@@ -112,6 +117,7 @@ def _shard_store(
     shard_size: int,
     shuffle: bool,
     seed: int | None,
+    compression: str | None = None,
 ) -> None:
     """
     Core sharding loop operating on an already-opened AnnData object.
@@ -158,7 +164,7 @@ def _shard_store(
             obsm=obsm,
             layers=layers,
             uns=adata.uns.copy(),
-        ).write_h5ad(out_filename)
+        ).write_h5ad(out_filename, compression=compression)
 
     logger.info("All shards successfully created.")
 
@@ -201,6 +207,15 @@ def register_subcommand(subparsers: argparse._SubParsersAction[argparse.Argument
         metavar="N",
         help="Random seed for reproducible shuffling (requires --shuffle).",
     )
+    p.add_argument(
+        "--compression",
+        default=None,
+        metavar="FILTER",
+        help=(
+            "HDF5 compression filter for output shard files "
+            '(e.g. "gzip", "lzf"). Default: no compression.'
+        ),
+    )
     p.set_defaults(func=_run)
 
 
@@ -212,4 +227,5 @@ def _run(args: argparse.Namespace) -> None:
         args.size,
         shuffle=args.shuffle,
         seed=args.seed,
+        compression=args.compression,
     )
