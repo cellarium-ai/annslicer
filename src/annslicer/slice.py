@@ -55,6 +55,7 @@ def _open_zarr_backed(input_file: str) -> ad.AnnData:
 def shard_h5ad(
     input_file: str,
     output_prefix: str,
+    output_filenames: list[str] | None = None,
     shard_size: int = 10000,
     shuffle: bool = False,
     seed: int | None = None,
@@ -78,6 +79,11 @@ def shard_h5ad(
     output_prefix:
         Prefix for output shard filenames, e.g. ``"dataset"`` produces
         ``dataset_shard_0.h5ad``, ``dataset_shard_1.h5ad``, etc.
+    output_filenames:
+        Optional list of output shard filenames to write, e.g.
+        ``["shard_a.h5ad", "shard_b.h5ad", ...]``.  If provided, overrides the default naming scheme based on
+        ``output_prefix`` and ``shard_size``.  Must be the same length as the number of shards needed to
+        cover all cells in the input file.
     shard_size:
         Number of cells (rows) per shard. Defaults to 10 000.
     shuffle:
@@ -100,7 +106,9 @@ def shard_h5ad(
         adata = ad.read_h5ad(input_file, backed="r")
 
     try:
-        _shard_store(adata, output_prefix, shard_size, shuffle, seed, compression)
+        _shard_store(
+            adata, output_prefix, output_filenames, shard_size, shuffle, seed, compression
+        )
     finally:
         if hasattr(adata, "file") and adata.file.is_open:
             adata.file.close()
@@ -114,6 +122,7 @@ def _unwrap(arr: np.ndarray) -> Any:
 def _shard_store(
     adata: ad.AnnData,
     output_prefix: str,
+    output_filenames: list[str] | None,
     shard_size: int,
     shuffle: bool,
     seed: int | None,
@@ -127,6 +136,15 @@ def _shard_store(
     indices are sorted prior to reading (sequential I/O), then reordered in
     memory into the target permutation order, avoiding random disk seeks.
     """
+    if (
+        output_filenames is not None
+        and len(output_filenames) < (adata.n_obs + shard_size - 1) // shard_size
+    ):
+        raise ValueError(
+            f"Not enough output filenames provided: expected at least "
+            f"{(adata.n_obs + shard_size - 1) // shard_size}, got {len(output_filenames)}"
+        )
+
     total_cells = adata.n_obs
 
     perm: np.ndarray | None = None
@@ -139,7 +157,11 @@ def _shard_store(
     for start_idx in range(0, total_cells, shard_size):
         end_idx = min(start_idx + shard_size, total_cells)
         shard_num = start_idx // shard_size
-        out_filename = f"{output_prefix}_shard_{shard_num}.h5ad"
+        out_filename = (
+            output_filenames[shard_num]
+            if output_filenames is not None
+            else f"{output_prefix}_shard_{shard_num}.h5ad"
+        )
         logger.info("  Writing %s (cells %d–%d)...", out_filename, start_idx, end_idx)
 
         if perm is not None:
