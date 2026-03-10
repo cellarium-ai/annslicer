@@ -126,6 +126,14 @@ shard_h5ad("large_atlas.h5ad", "atlas", shard_size=20000, shuffle=True, seed=0)
 # Gzip-compressed shards — smaller files at the cost of write speed
 shard_h5ad("large_atlas.h5ad", "atlas", shard_size=20000, compression="gzip")
 
+# Custom output filenames — provide explicit paths instead of auto-generated names
+shard_h5ad(
+    "large_atlas.h5ad",
+    "atlas",  # ignored when output_filenames is provided
+    shard_size=20000,
+    output_filenames=["batch_0.h5ad", "batch_1.h5ad", "batch_2.h5ad"],
+)
+
 # Merge shards back into one file (identical-var fast path used automatically)
 merge_out_of_core(["atlas_shard_0.h5ad", "atlas_shard_1.h5ad"], "merged.h5ad")
 

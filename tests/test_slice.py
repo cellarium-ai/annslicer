@@ -5,6 +5,7 @@ Tests for annslicer.slice
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import anndata as ad
 import numpy as np
@@ -162,6 +163,53 @@ def test_shard_different_seeds_differ(synthetic_h5ad, tmp_path):
     names1 = ad.read_h5ad(list(sorted(tmp_path.glob("s1_shard*.h5ad")))[0]).obs_names.tolist()
     names2 = ad.read_h5ad(list(sorted(tmp_path.glob("s2_shard*.h5ad")))[0]).obs_names.tolist()
     assert names1 != names2, "Different seeds should (almost certainly) produce different shuffles"
+
+
+# ---------------------------------------------------------------------------
+# output_filenames tests
+# ---------------------------------------------------------------------------
+
+
+def test_output_filenames_respected(synthetic_h5ad, tmp_path):
+    """Custom output_filenames are used instead of the default naming scheme."""
+    n_shards = math.ceil(N_CELLS / SHARD_SIZE)
+    custom_names = [str(tmp_path / f"custom_{i:02d}.h5ad") for i in range(n_shards)]
+    shard_h5ad(
+        synthetic_h5ad,
+        str(tmp_path / "unused_prefix"),
+        output_filenames=custom_names,
+        shard_size=SHARD_SIZE,
+    )
+
+    for path in custom_names:
+        assert Path(path).exists(), f"Expected shard file {path} was not created"
+
+
+def test_output_filenames_cell_counts(synthetic_h5ad, tmp_path):
+    """Shards written to custom filenames contain the expected number of cells."""
+    n_shards = math.ceil(N_CELLS / SHARD_SIZE)
+    custom_names = [str(tmp_path / f"named_{i}.h5ad") for i in range(n_shards)]
+    shard_h5ad(
+        synthetic_h5ad, str(tmp_path / "p"), output_filenames=custom_names, shard_size=SHARD_SIZE
+    )
+
+    all_obs: list[str] = []
+    for path in custom_names:
+        adata = ad.read_h5ad(path)
+        assert adata.n_obs == SHARD_SIZE
+        all_obs.extend(adata.obs_names.tolist())
+
+    assert len(all_obs) == N_CELLS
+    assert len(set(all_obs)) == N_CELLS
+
+
+def test_output_filenames_too_few_raises(synthetic_h5ad, tmp_path):
+    """Passing fewer filenames than shards raises ValueError."""
+    too_few = [str(tmp_path / "only_one.h5ad")]
+    with pytest.raises(ValueError, match="Not enough output filenames"):
+        shard_h5ad(
+            synthetic_h5ad, str(tmp_path / "p"), output_filenames=too_few, shard_size=SHARD_SIZE
+        )
 
 
 # ---------------------------------------------------------------------------
