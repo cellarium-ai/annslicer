@@ -2,6 +2,11 @@
 
 **Out-of-core sharding and merging of large AnnData files with minimal memory usage.**
 
+[![License](https://img.shields.io/github/license/cellarium-ai/annslicer?color=white)](LICENSE.md)
+[![PyPI](https://img.shields.io/pypi/v/annslicer.svg)](https://pypi.org/project/annslicer)
+[![Downloads](https://static.pepy.tech/personalized-badge/annslicer?period=total&units=international_system&left_color=grey&right_color=blue&left_text=pypi%20downloads)](https://pepy.tech/project/annslicer)
+[![Stars](https://img.shields.io/github/stars/cellarium-ai/annslicer?color=yellow&logoColor=yellow)](https://github.com/cellarium-ai/annslicer/stargazers)
+
 ![Diagram](diagram.png)
 
 Large single-cell datasets stored as `.h5ad` or `.zarr` files can easily exceed available RAM. `annslicer` slices them into manageable shards — and merges them back — without loading full matrices into memory. It uses best practices from `anndata` with a few small speed improvements for random shuffling.
