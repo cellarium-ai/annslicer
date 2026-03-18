@@ -92,7 +92,12 @@ def _write_remapped_sparse(
     """
     old_data = in_store[path]["data"][:]  # type: ignore[index]
     old_indices = in_store[path]["indices"][:]  # type: ignore[index]
-    old_indptr = in_store[path]["indptr"][:]  # type: ignore[index]
+    # Cast to int64 immediately: on-disk indptr is int32 in h5ad files written by older
+    # versions of anndata.  Adding a large current_nnz offset in int32 arithmetic silently
+    # overflows once total nnz exceeds ~2.1 B, producing negative indptr values and a
+    # structurally corrupt output CSR matrix.  Casting unconditionally is safe: it is a
+    # no-op for files that already store int64, and protective for int32 files.
+    old_indptr = in_store[path]["indptr"][:].astype(np.int64)  # type: ignore[index]
 
     if is_identity:
         shard_nnz = len(old_data)
@@ -138,6 +143,54 @@ def _write_remapped_sparse(
 
 
 # ---------------------------------------------------------------------------
+# Output integrity validation
+# ---------------------------------------------------------------------------
+
+
+def _validate_merge_indptr(out_store: object, expected_nnz_map: dict[str, int]) -> None:
+    """Validate that CSR ``indptr`` arrays in the output store are non-corrupt.
+
+    Checks two conditions for each sparse group path:
+
+    1. No negative values — a negative entry is the signature of an int32
+       overflow during the indptr-shift arithmetic in :func:`_write_remapped_sparse`.
+    2. The final value equals the expected total nnz — guards against
+       off-by-one errors or a truncated write.
+
+    Only the compact ``indptr`` arrays are read (``n_cells + 1`` int64 values),
+    so this check is cheap even for very large files.
+
+    Parameters
+    ----------
+    out_store:
+        An open h5py ``File`` or zarr ``Group`` for the output file.
+    expected_nnz_map:
+        Mapping of sparse group path to expected total non-zero count,
+        e.g. ``{"X": 12_345_678, "layers/counts": 9_876_543}``.
+
+    Raises
+    ------
+    RuntimeError
+        If any ``indptr`` array contains negative values or its final entry
+        does not match the expected nnz.
+    """
+    for path, expected_nnz in expected_nnz_map.items():
+        indptr = out_store[path]["indptr"][:].astype(np.int64)  # type: ignore[index]
+        if np.any(indptr < 0):
+            raise RuntimeError(
+                f"Corrupt output detected: '{path}/indptr' contains negative values "
+                f"(likely caused by int32 overflow during the indptr shift). "
+                f"Re-run the merge to obtain a correct output file."
+            )
+        actual_nnz = int(indptr[-1])
+        if actual_nnz != expected_nnz:
+            raise RuntimeError(
+                f"Corrupt output detected: '{path}/indptr' ends at {actual_nnz}, "
+                f"expected {expected_nnz}."
+            )
+
+
+# ---------------------------------------------------------------------------
 # Main merge function
 # ---------------------------------------------------------------------------
 
@@ -146,6 +199,7 @@ def merge_out_of_core(
     input_files: list[str],
     output_file: str,
     join: str = "outer",
+    validate: bool = False,
 ) -> None:
     """
     Merge multiple sharded .h5ad or .zarr files into a single large file
@@ -166,6 +220,12 @@ def merge_out_of_core(
         ``"outer"`` (default) takes the union of all gene sets and fills
         missing entries with zeros.  ``"inner"`` keeps only genes present in
         every shard.  Layers absent from any shard are always dropped.
+    validate:
+        When ``True``, checks every ``indptr`` array in the output file for
+        negative values and the correct final nnz immediately after writing,
+        raising :class:`RuntimeError` if corruption is detected.  The check
+        reads only the compact ``indptr`` arrays so the overhead is negligible
+        even for large files.  Defaults to ``False``.
     """
     if join not in ("inner", "outer"):
         raise ValueError(f"join must be 'inner' or 'outer', got {join!r}")
@@ -420,6 +480,14 @@ def merge_out_of_core(
         out_store["X"]["indptr"][total_cells] = current_nnz_X
     for layer, final_nnz in current_nnz_layers.items():
         out_store[f"layers/{layer}"]["indptr"][total_cells] = final_nnz
+
+    if validate:
+        _nnz_map: dict[str, int] = {}
+        if "X" in matrix_nnz:
+            _nnz_map["X"] = current_nnz_X
+        for layer, final_nnz in current_nnz_layers.items():
+            _nnz_map[f"layers/{layer}"] = final_nnz
+        _validate_merge_indptr(out_store, _nnz_map)
 
     if hasattr(out_store, "close"):
         out_store.close()

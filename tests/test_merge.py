@@ -8,12 +8,13 @@ import math
 from pathlib import Path
 
 import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sp
 
-from annslicer.merge import merge_out_of_core
+from annslicer.merge import _validate_merge_indptr, _write_remapped_sparse, merge_out_of_core
 from annslicer.slice import shard_h5ad
 
 N_CELLS = 150
@@ -427,3 +428,166 @@ def test_cli_glob_no_match_exits(tmp_path: Path) -> None:
     )
     with pytest.raises(SystemExit):
         _run(args)
+
+
+# ---------------------------------------------------------------------------
+# int32 indptr overflow regression tests
+# ---------------------------------------------------------------------------
+
+_INT32_MAX = np.iinfo(np.int32).max  # 2_147_483_647
+
+
+# --- Lightweight mocks used by test_write_remapped_sparse_no_indptr_overflow ---
+
+
+class _WriteCaptureSink:
+    """Captures the last-written value; supports any subscript key without allocating storage."""
+
+    def __init__(self) -> None:
+        self.last_written: np.ndarray | None = None
+
+    def __setitem__(self, key: object, value: object) -> None:
+        self.last_written = np.asarray(value, dtype=np.int64).copy()
+
+
+class _NoOpSink:
+    """Accepts writes and discards them — avoids allocating giant arrays in tests."""
+
+    def __setitem__(self, key: object, value: object) -> None:
+        pass
+
+
+class _MockOutSparseGroup:
+    """Mimics the nested dict-like access pattern of a CSR group in the output store."""
+
+    def __init__(self) -> None:
+        self.data = _NoOpSink()
+        self.indices = _NoOpSink()
+        self.indptr = _WriteCaptureSink()
+
+    def __getitem__(self, key: str) -> object:
+        return getattr(self, key)
+
+
+class _ArrayDataset:
+    """Read-only dataset backed by a numpy array (mimics h5py Dataset slice access)."""
+
+    def __init__(self, arr: np.ndarray) -> None:
+        self._arr = arr
+
+    def __getitem__(self, key: object) -> np.ndarray:
+        return self._arr[key]  # type: ignore[index]
+
+    def __len__(self) -> int:
+        return len(self._arr)
+
+
+class _MockInSparseGroup:
+    """Mimics the nested access for the input-store side: in_store[path]["data"][:] etc."""
+
+    def __init__(self, data: np.ndarray, indices: np.ndarray, indptr: np.ndarray) -> None:
+        self._d = {
+            "data": _ArrayDataset(data),
+            "indices": _ArrayDataset(indices),
+            "indptr": _ArrayDataset(indptr),
+        }
+
+    def __getitem__(self, key: str) -> _ArrayDataset:
+        return self._d[key]
+
+
+# --- Tests ---
+
+
+def test_indptr_int32_overflow_arithmetic() -> None:
+    """
+    Documents the arithmetic root-cause: adding a large current_nnz offset to
+    an int32 indptr silently wraps to a negative value in numpy, while casting
+    to int64 first produces the correct result.
+    """
+    local_indptr = np.array([0, 3, 6], dtype=np.int32)
+    current_nnz = _INT32_MAX - 2  # 2_147_483_645; adding 6 exceeds int32 range
+
+    # Without the fix: numpy keeps int32 → last entry wraps negative
+    shifted_int32 = local_indptr + current_nnz
+    assert shifted_int32.dtype == np.int32, "precondition: numpy preserves int32 dtype"
+    assert shifted_int32[-1] < 0, "expected int32 overflow to produce a negative sentinel"
+
+    # With the fix: cast to int64 first → no overflow
+    shifted_int64 = local_indptr.astype(np.int64) + current_nnz
+    assert shifted_int64.dtype == np.int64
+    assert shifted_int64[-1] == current_nnz + 6
+
+
+def test_write_remapped_sparse_no_indptr_overflow() -> None:
+    """
+    Regression test: _write_remapped_sparse must not write negative indptr
+    values when current_nnz is near the int32 maximum.
+
+    Uses a mock in-store whose indptr is explicitly int32 (simulating an h5ad
+    file written by older anndata) and a current_nnz chosen so that the last
+    shifted value would overflow int32 without the astype(int64) fix.
+    """
+    # 2-row shard, 3 nnz per row → local indptr = [0, 3, 6]
+    data = np.ones(6, dtype=np.float32)
+    indices = np.array([0, 1, 2, 0, 1, 2], dtype=np.int32)
+    indptr_int32 = np.array([0, 3, 6], dtype=np.int32)  # old anndata on-disk dtype
+
+    in_store: dict = {"X": _MockInSparseGroup(data, indices, indptr_int32)}
+    out_grp = _MockOutSparseGroup()
+    out_store: dict = {"X": out_grp}
+
+    # current_nnz + 6 = 2_147_483_651, which overflows int32 → negative without the fix
+    current_nnz = _INT32_MAX - 2
+
+    new_nnz = _write_remapped_sparse(
+        out_store,
+        in_store,
+        "X",
+        remap=np.arange(3, dtype=np.int32),
+        is_identity=True,
+        join="outer",
+        current_nnz=current_nnz,
+        current_cell=0,
+        num_cells=2,
+    )
+
+    written = out_grp.indptr.last_written
+    assert written is not None
+    assert np.all(written >= 0), f"indptr overflow: wrote negative values {written}"
+    # indptr[:-1] is written: rows 0 and 1 → [current_nnz + 0, current_nnz + 3]
+    np.testing.assert_array_equal(
+        written,
+        np.array([current_nnz, current_nnz + 3], dtype=np.int64),
+    )
+    assert new_nnz == current_nnz + 6
+
+
+def test_merge_validate_passes_on_valid_output(mismatched_pair: tuple, tmp_path: Path) -> None:
+    """merge_out_of_core with validate=True completes without error on a valid merge."""
+    path_a, path_b, _, _ = mismatched_pair
+    out = str(tmp_path / "validated.h5ad")
+    merge_out_of_core([path_a, path_b], out, validate=True)  # must not raise
+    assert Path(out).exists()
+
+
+def test_merge_validate_detects_corrupt_indptr(mismatched_pair: tuple, tmp_path: Path) -> None:
+    """
+    _validate_merge_indptr raises RuntimeError when an indptr array contains
+    a negative value — the exact signature of an int32 overflow during merge.
+    """
+    path_a, path_b, _, _ = mismatched_pair
+    out = str(tmp_path / "corrupted.h5ad")
+    merge_out_of_core([path_a, path_b], out)
+
+    # Record the legitimate final nnz before corruption
+    with h5py.File(out, "r") as f:
+        expected_nnz = int(f["X"]["indptr"][-1])
+
+    # Simulate the int32 overflow corruption by injecting a negative indptr entry
+    with h5py.File(out, "r+") as f:
+        f["X"]["indptr"][5] = -1
+
+    with h5py.File(out, "r") as f:
+        with pytest.raises(RuntimeError, match="negative values"):
+            _validate_merge_indptr(f, {"X": expected_nnz})
