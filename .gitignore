@@ -5,6 +5,12 @@ __pycache__/
 *.pyd
 *.so
 
+# adobe illustrator
+*.ai
+
+# vscode
+.vscode/
+
 # Distribution / packaging
 dist/
 build/

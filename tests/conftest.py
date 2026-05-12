@@ -98,3 +98,46 @@ def synthetic_zarr(tmp_path_factory: pytest.TempPathFactory) -> str:
     zarr_path = str(out_dir / "synthetic.zarr")
     adata.write_zarr(zarr_path)
     return zarr_path
+
+
+@pytest.fixture(scope="session")
+def synthetic_csv_categorical(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """
+    Write a CSV with cell barcodes and a ``cell_type`` column matching the
+    synthetic h5ad fixture.  The column is written as plain strings (not
+    categorical) to verify that _merge_csv_into_obs coerces it automatically.
+
+    Returns the path to the CSV file.
+    """
+    import csv
+
+    rows = [["cell_id", "cell_type"]] + [
+        [f"cell_{i}", f"type_{i % 3}"] for i in range(N_CELLS)
+    ]
+    out_dir = tmp_path_factory.mktemp("csv_data")
+    csv_path = str(out_dir / "cell_types.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerows(rows)
+    return csv_path
+
+
+@pytest.fixture(scope="session")
+def synthetic_csv_bool(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """
+    Write a CSV with cell barcodes and a ``keep`` boolean column.
+    First 100 cells are True, last 50 are False.
+
+    Returns the path to the CSV file.
+    """
+    import csv
+
+    rows = [["cell_id", "keep"]] + [
+        [f"cell_{i}", i < 100] for i in range(N_CELLS)
+    ]
+    out_dir = tmp_path_factory.mktemp("csv_bool_data")
+    csv_path = str(out_dir / "keep_flags.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerows(rows)
+    return csv_path

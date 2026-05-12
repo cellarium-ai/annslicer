@@ -6,11 +6,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 from typing import Any
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 
+from annslicer._common import _merge_csv_into_obs, _unwrap, _write_shard_from_indices
 from annslicer._store import _require_zarr
 
 logger = logging.getLogger(__name__)
@@ -114,11 +117,6 @@ def shard_h5ad(
             adata.file.close()
 
 
-def _unwrap(arr: np.ndarray) -> Any:
-    """Unwrap the 0-d object array that h5py sometimes returns for backed sparse layers."""
-    return arr.item() if isinstance(arr, np.ndarray) and arr.ndim == 0 else arr
-
-
 def _shard_store(
     adata: ad.AnnData,
     output_prefix: str,
@@ -172,23 +170,173 @@ def _shard_store(
             layers = {k: _unwrap(adata.layers[k][sorted_idx, :])[restore] for k in adata.layers}
             obsm = {k: np.asarray(adata.obsm[k][sorted_idx])[restore] for k in adata.obsm}
             obs = adata.obs.iloc[orig_idx]
+            ad.AnnData(
+                X=X,
+                obs=obs.copy(),
+                var=adata.var.copy(),
+                obsm=obsm,
+                layers=layers,
+                uns=adata.uns.copy(),
+            ).write_h5ad(out_filename, compression=compression)
         else:
-            s = slice(start_idx, end_idx)
-            X = _unwrap(adata.X[s, :])
-            layers = {k: _unwrap(adata.layers[k][s, :]) for k in adata.layers}
-            obsm = {k: np.asarray(adata.obsm[k][s]) for k in adata.obsm}
-            obs = adata.obs.iloc[start_idx:end_idx]
-
-        ad.AnnData(
-            X=X,
-            obs=obs.copy(),
-            var=adata.var.copy(),
-            obsm=obsm,
-            layers=layers,
-            uns=adata.uns.copy(),
-        ).write_h5ad(out_filename, compression=compression)
+            _write_shard_from_indices(
+                adata,
+                np.arange(start_idx, end_idx, dtype=np.intp),
+                out_filename,
+                compression,
+            )
 
     logger.info("All shards successfully created.")
+
+
+def shard_by_obs_column(
+    input_file: str,
+    output_prefix: str,
+    obs_column: str,
+    csv_file: str | None = None,
+    join_column: str | None = None,
+    always_include: list[str] | None = None,
+    compression: str | None = None,
+) -> None:
+    """
+    Shard a large .h5ad or .zarr file by grouping cells according to a
+    categorical ``adata.obs`` column.
+
+    One output .h5ad file is produced per category (excluding any categories
+    listed in ``always_include``).  Output filenames are derived from the
+    category names rather than shard numbers:
+    ``{output_prefix}_{safe_category_name}.h5ad``.
+
+    Parameters
+    ----------
+    input_file:
+        Path to the source .h5ad or .zarr file.
+    output_prefix:
+        Prefix for output shard filenames.
+    obs_column:
+        Name of the column in ``adata.obs`` (or in the auxiliary CSV) to
+        partition on.  Must be (or be coercible to) a categorical dtype.
+    csv_file:
+        Optional path to a CSV file containing extra per-cell metadata.  The
+        CSV is merged into ``adata.obs`` before partitioning.  Columns from
+        the CSV that are not already categorical are automatically coerced to
+        ``pd.CategoricalDtype``.
+    join_column:
+        Column in the CSV to use as the join key (cell barcode).  Defaults to
+        the CSV's first column.
+    always_include:
+        One or more category values to append to *every* output shard.  Cells
+        belonging to these categories are copied into each shard but do not
+        produce a dedicated output file of their own.
+    compression:
+        HDF5 compression filter for output files (e.g. ``"gzip"``).
+    """
+    if input_file.endswith(".zarr"):
+        logger.info("Opening zarr store %s in backed mode via sparse_dataset...", input_file)
+        adata = _open_zarr_backed(input_file)
+    else:
+        logger.info("Opening %s in backed mode...", input_file)
+        adata = ad.read_h5ad(input_file, backed="r")
+
+    try:
+        _shard_by_obs_column_store(
+            adata,
+            output_prefix,
+            obs_column,
+            csv_file,
+            join_column,
+            always_include,
+            compression,
+        )
+    finally:
+        if hasattr(adata, "file") and adata.file.is_open:
+            adata.file.close()
+
+
+def _shard_by_obs_column_store(
+    adata: ad.AnnData,
+    output_prefix: str,
+    obs_column: str,
+    csv_file: str | None,
+    join_column: str | None,
+    always_include: list[str] | None,
+    compression: str | None,
+) -> None:
+    """Core logic for :func:`shard_by_obs_column` operating on an open AnnData."""
+    # --- Merge auxiliary CSV into obs if provided ---
+    if csv_file is not None:
+        adata.obs = _merge_csv_into_obs(adata.obs, csv_file, join_column)
+
+    # --- Validate obs_column is categorical ---
+    if obs_column not in adata.obs.columns:
+        raise KeyError(f"obs_column {obs_column!r} not found in adata.obs.")
+    obs_col = adata.obs[obs_column]
+    if not isinstance(obs_col.dtype, pd.CategoricalDtype):
+        raise ValueError(
+            f"obs_column {obs_column!r} has dtype {obs_col.dtype!r}, expected a categorical. "
+            f"Cast the column to a categorical before calling shard_by_obs_column, "
+            f"or provide it via --csv-file (CSV columns are coerced automatically)."
+        )
+
+    categories = list(obs_col.cat.categories)
+    always_include_set: set[str] = set(always_include) if always_include else set()
+
+    # --- Validate always_include values ---
+    if always_include_set:
+        unknown = always_include_set - set(categories)
+        if unknown:
+            raise ValueError(
+                f"always_include contains value(s) not found in category list: "
+                f"{sorted(unknown)}. Valid categories are: {categories}."
+            )
+
+    # --- Compute always-include indices ---
+    if always_include_set:
+        always_idx = np.where(obs_col.isin(always_include_set))[0]
+    else:
+        always_idx = np.array([], dtype=np.intp)
+
+    # --- Sanitize names and check for collisions ---
+    shard_categories = [c for c in categories if c not in always_include_set]
+    safe_names: dict[str, str] = {}  # category -> safe filename fragment
+    seen_safe: dict[str, str] = {}   # safe name -> original category (for collision detection)
+    for cat in shard_categories:
+        safe = re.sub(r"[^\w.-]", "_", str(cat))
+        if safe in seen_safe:
+            raise ValueError(
+                f"Category names {cat!r} and {seen_safe[safe]!r} both sanitize to the "
+                f"same filename fragment {safe!r}. Rename one of the categories so that "
+                f"their alphanumeric representations are distinct."
+            )
+        seen_safe[safe] = cat
+        safe_names[cat] = safe
+
+    # --- Write one shard per category ---
+    shards_written = 0
+    for cat in shard_categories:
+        cat_idx = np.where(obs_col == cat)[0]
+        if len(cat_idx) == 0:
+            logger.warning(
+                "Category %r has no cells — skipping (no output file will be written).", cat
+            )
+            continue
+
+        indices = np.sort(np.concatenate([cat_idx, always_idx]))
+        out_filename = f"{output_prefix}_{safe_names[cat]}.h5ad"
+        logger.info(
+            "  Writing %s (%d cells + %d always-include)...",
+            out_filename,
+            len(cat_idx),
+            len(always_idx),
+        )
+        _write_shard_from_indices(adata, indices, out_filename, compression)
+        shards_written += 1
+
+    logger.info(
+        "shard_by_obs_column complete: %d shards written for column %r.",
+        shards_written,
+        obs_column,
+    )
 
 
 def register_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -238,16 +386,64 @@ def register_subcommand(subparsers: argparse._SubParsersAction[argparse.Argument
             '(e.g. "gzip", "lzf"). Default: no compression.'
         ),
     )
+    p.add_argument(
+        "--obs-column",
+        default=None,
+        metavar="COLUMN",
+        help=(
+            "Partition cells by this categorical obs column instead of fixed-size shards. "
+            "Each category produces one output file named {output_prefix}_{category}.h5ad."
+        ),
+    )
+    p.add_argument(
+        "--csv-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to an auxiliary CSV file with extra per-cell metadata. "
+            "Merged into obs before partitioning (columns coerced to categorical)."
+        ),
+    )
+    p.add_argument(
+        "--join-column",
+        default=None,
+        metavar="COLUMN",
+        help=(
+            "Column in the CSV to use as the cell-barcode join key. "
+            "Defaults to the CSV's first column."
+        ),
+    )
+    p.add_argument(
+        "--always-include",
+        nargs="+",
+        default=None,
+        metavar="VALUE",
+        help=(
+            "One or more category values to append to every output shard "
+            "(e.g. non-targeting control cells). Requires --obs-column."
+        ),
+    )
     p.set_defaults(func=_run)
 
 
 def _run(args: argparse.Namespace) -> None:
     """Dispatch function called by the CLI after argument parsing."""
-    shard_h5ad(
-        args.input_file,
-        args.output_prefix,
-        args.size,
-        shuffle=args.shuffle,
-        seed=args.seed,
-        compression=args.compression,
-    )
+    if args.obs_column is not None:
+        shard_by_obs_column(
+            args.input_file,
+            args.output_prefix,
+            args.obs_column,
+            csv_file=args.csv_file,
+            join_column=args.join_column,
+            always_include=args.always_include,
+            compression=args.compression,
+        )
+    else:
+        shard_h5ad(
+            args.input_file,
+            args.output_prefix,
+            shard_size=args.size,
+            shuffle=args.shuffle,
+            seed=args.seed,
+            compression=args.compression,
+        )

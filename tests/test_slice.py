@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from annslicer.slice import shard_h5ad
+from annslicer.slice import shard_by_obs_column, shard_h5ad
 
 # Match the constants from conftest.py
 N_CELLS = 150
@@ -271,3 +271,200 @@ def test_slice_zarr_input_shuffle(synthetic_zarr, tmp_path):
         all_indices.extend(ad.read_h5ad(path).obs_names.tolist())
     assert len(all_indices) == N_CELLS
     assert len(set(all_indices)) == N_CELLS
+
+
+# ---------------------------------------------------------------------------
+# shard_by_obs_column tests
+# ---------------------------------------------------------------------------
+
+# The synthetic_h5ad fixture has cell_type in {type_0, type_1, type_2}, 50 cells each.
+CATEGORIES = ["type_0", "type_1", "type_2"]
+N_PER_CATEGORY = 50
+
+
+def test_obs_shard_file_count(synthetic_h5ad, tmp_path):
+    """Exactly one output file per non-empty category."""
+    shard_by_obs_column(synthetic_h5ad, str(tmp_path / "out"), "cell_type")
+    files = list(tmp_path.glob("out_*.h5ad"))
+    assert len(files) == len(CATEGORIES)
+
+
+def test_obs_shard_filenames(synthetic_h5ad, tmp_path):
+    """Output filenames contain the category names."""
+    shard_by_obs_column(synthetic_h5ad, str(tmp_path / "out"), "cell_type")
+    names = {p.name for p in tmp_path.glob("out_*.h5ad")}
+    for cat in CATEGORIES:
+        assert f"out_{cat}.h5ad" in names, f"Expected file out_{cat}.h5ad"
+
+
+def test_obs_shard_cell_assignment(synthetic_h5ad, tmp_path):
+    """Every cell in a shard belongs to that shard's category."""
+    shard_by_obs_column(synthetic_h5ad, str(tmp_path / "out"), "cell_type")
+    for cat in CATEGORIES:
+        adata = ad.read_h5ad(tmp_path / f"out_{cat}.h5ad")
+        assert all(v == cat for v in adata.obs["cell_type"]), f"Unexpected cells in shard {cat}"
+
+
+def test_obs_shard_no_overlap(synthetic_h5ad, tmp_path):
+    """Non-always-include cells appear in exactly one shard."""
+    shard_by_obs_column(synthetic_h5ad, str(tmp_path / "out"), "cell_type")
+    all_cells: list[str] = []
+    for cat in CATEGORIES:
+        all_cells.extend(ad.read_h5ad(tmp_path / f"out_{cat}.h5ad").obs_names.tolist())
+    assert len(all_cells) == N_CELLS
+    assert len(set(all_cells)) == N_CELLS
+
+
+def test_obs_shard_full_coverage(synthetic_h5ad, tmp_path):
+    """Union of cells across all shards equals the full dataset."""
+    shard_by_obs_column(synthetic_h5ad, str(tmp_path / "out"), "cell_type")
+    all_cells: set[str] = set()
+    for path in tmp_path.glob("out_*.h5ad"):
+        all_cells.update(ad.read_h5ad(path).obs_names.tolist())
+    assert len(all_cells) == N_CELLS
+
+
+def test_obs_shard_var_preserved(synthetic_h5ad, tmp_path):
+    """var DataFrame is identical across all shards."""
+    shard_by_obs_column(synthetic_h5ad, str(tmp_path / "out"), "cell_type")
+    ref = ad.read_h5ad(tmp_path / f"out_{CATEGORIES[0]}.h5ad").var
+    for cat in CATEGORIES[1:]:
+        shard_var = ad.read_h5ad(tmp_path / f"out_{cat}.h5ad").var
+        assert ref.equals(shard_var)
+
+
+def test_obs_shard_non_categorical_raises(synthetic_h5ad, tmp_path):
+    """ValueError when the obs column is not categorical."""
+    import anndata as ad_mod
+
+    # Write a version with a numeric (non-categorical) column
+    adata = ad_mod.read_h5ad(synthetic_h5ad)
+    adata.obs["score"] = np.arange(N_CELLS, dtype=np.float32)
+    alt = str(tmp_path / "alt.h5ad")
+    adata.write_h5ad(alt)
+
+    with pytest.raises(ValueError, match="expected a categorical"):
+        shard_by_obs_column(alt, str(tmp_path / "out"), "score")
+
+
+def test_obs_shard_missing_column_raises(synthetic_h5ad, tmp_path):
+    """KeyError when the obs column doesn't exist."""
+    with pytest.raises(KeyError):
+        shard_by_obs_column(synthetic_h5ad, str(tmp_path / "out"), "nonexistent_column")
+
+
+def test_obs_shard_zarr_input(synthetic_zarr, tmp_path):
+    """shard_by_obs_column works with a zarr input file."""
+    shard_by_obs_column(synthetic_zarr, str(tmp_path / "out"), "cell_type")
+    files = list(tmp_path.glob("out_*.h5ad"))
+    assert len(files) == len(CATEGORIES)
+    all_cells: list[str] = []
+    for path in files:
+        all_cells.extend(ad.read_h5ad(path).obs_names.tolist())
+    assert len(all_cells) == N_CELLS
+    assert len(set(all_cells)) == N_CELLS
+
+
+def test_obs_shard_csv_merge(synthetic_h5ad, synthetic_csv_categorical, tmp_path):
+    """CSV merge path produces the same shards as using the built-in obs column."""
+    # Write a version of the h5ad that does NOT have cell_type in obs
+    import anndata as ad_mod
+
+    adata = ad_mod.read_h5ad(synthetic_h5ad)
+    adata.obs = adata.obs.drop(columns=["cell_type"])
+    no_cat = str(tmp_path / "no_cell_type.h5ad")
+    adata.write_h5ad(no_cat)
+
+    shard_by_obs_column(
+        no_cat,
+        str(tmp_path / "csv"),
+        "cell_type",
+        csv_file=synthetic_csv_categorical,
+    )
+    files = list(tmp_path.glob("csv_*.h5ad"))
+    assert len(files) == len(CATEGORIES)
+    all_cells: list[str] = []
+    for path in files:
+        all_cells.extend(ad.read_h5ad(path).obs_names.tolist())
+    assert len(set(all_cells)) == N_CELLS
+
+
+def test_obs_shard_csv_missing_cells_raises(synthetic_h5ad, tmp_path):
+    """ValueError when the CSV is missing cell barcodes present in the h5ad."""
+    import csv
+
+    # Write a CSV that only covers the first 100 cells
+    partial_csv = str(tmp_path / "partial.csv")
+    with open(partial_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["cell_id", "cell_type"])
+        for i in range(100):
+            writer.writerow([f"cell_{i}", f"type_{i % 3}"])
+
+    with pytest.raises(ValueError, match="missing"):
+        shard_by_obs_column(
+            synthetic_h5ad,
+            str(tmp_path / "out"),
+            "cell_type",
+            csv_file=partial_csv,
+        )
+
+
+def test_obs_shard_always_include_in_every_shard(synthetic_h5ad, tmp_path):
+    """Cells from always_include categories appear in every output shard."""
+    # always_include = ["type_2"] → type_2 cells (cell_100..cell_149) appear in type_0 and type_1 shards
+    shard_by_obs_column(
+        synthetic_h5ad,
+        str(tmp_path / "out"),
+        "cell_type",
+        always_include=["type_2"],
+    )
+    always_cells = {f"cell_{i}" for i in range(N_CELLS) if i % 3 == 2}  # type_2 cells
+    for cat in ["type_0", "type_1"]:
+        shard_obs_names = set(ad.read_h5ad(tmp_path / f"out_{cat}.h5ad").obs_names.tolist())
+        assert always_cells.issubset(shard_obs_names), (
+            f"Always-include cells missing from shard {cat}"
+        )
+
+
+def test_obs_shard_always_include_no_dedicated_shard(synthetic_h5ad, tmp_path):
+    """No dedicated output file is written for always_include categories."""
+    shard_by_obs_column(
+        synthetic_h5ad,
+        str(tmp_path / "out"),
+        "cell_type",
+        always_include=["type_2"],
+    )
+    assert not (tmp_path / "out_type_2.h5ad").exists()
+    # Only two shards: type_0 and type_1
+    files = list(tmp_path.glob("out_*.h5ad"))
+    assert len(files) == 2
+
+
+def test_obs_shard_always_include_invalid_raises(synthetic_h5ad, tmp_path):
+    """ValueError for always_include values not in the category list."""
+    with pytest.raises(ValueError, match="always_include"):
+        shard_by_obs_column(
+            synthetic_h5ad,
+            str(tmp_path / "out"),
+            "cell_type",
+            always_include=["nonexistent_category"],
+        )
+
+
+def test_obs_shard_sanitized_name_collision_raises(tmp_path):
+    """ValueError when two category names sanitize to the same filename fragment."""
+    import anndata as ad_mod
+    import pandas as pd
+    import scipy.sparse as sp_mod
+
+    rng = np.random.default_rng(0)
+    # "foo bar" and "foo_bar" both sanitize to "foo_bar"
+    cats = pd.Categorical(["foo bar"] * 5 + ["foo_bar"] * 5)
+    obs = pd.DataFrame({"grp": cats}, index=[f"c{i}" for i in range(10)])
+    adata = ad_mod.AnnData(X=rng.random((10, 5), dtype=np.float32), obs=obs)
+    h5ad = str(tmp_path / "collision.h5ad")
+    adata.write_h5ad(h5ad)
+
+    with pytest.raises(ValueError, match="sanitize"):
+        shard_by_obs_column(h5ad, str(tmp_path / "out"), "grp")
