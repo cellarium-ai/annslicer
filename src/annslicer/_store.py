@@ -59,3 +59,22 @@ def _is_sparse_group(store: Store, key: str) -> bool:
     # For both h5py.Group and zarr.Group the presence of 'data' + 'indptr'
     # sub-keys indicates a sparse CSR representation.
     return "data" in item and "indptr" in item
+
+
+def _store_create_array(
+    group: Store,
+    name: str,
+    *,
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+    dtype: object,
+) -> object:
+    """Create an array/dataset in *group*, compatible with h5py, zarr v2, and zarr v3.
+
+    zarr v3 renamed ``Group.create_dataset`` to ``Group.create_array``.  This
+    wrapper tries ``create_array`` first (zarr v3 and any h5py shim that exposes
+    it) and falls back to ``create_dataset`` (zarr v2 and h5py).
+    """
+    if hasattr(group, "create_array"):
+        return group.create_array(name, shape=shape, chunks=chunks, dtype=dtype)  # type: ignore[union-attr]
+    return group.create_dataset(name, shape=shape, chunks=chunks, dtype=dtype)  # type: ignore[union-attr]

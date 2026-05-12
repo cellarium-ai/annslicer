@@ -9,26 +9,38 @@
 
 ![Diagram](diagram.png)
 
-Large single-cell datasets stored as `.h5ad` or `.zarr` files can easily exceed available RAM. `annslicer` slices them into manageable shards — and merges them back — without loading full matrices into memory. It uses best practices from `anndata` with a few small speed improvements for random shuffling.
+Large single-cell datasets stored as `.h5ad` or `.zarr` files can easily exceed available RAM. `annslicer` filters them, slices them into manageable shards and merges them back — without loading full matrices into memory. It uses best practices from `anndata` with a few small speed improvements for random shuffling.
 
 Consolidates best practices into a simple command-line tool.
 
 ```bash
-annslicer slice input.h5ad output_prefix
+annslicer slice input.h5ad output_prefix --size 10000
 ```
 
 ```bash
-annslicer merge output.h5ad shard_0.h5ad shard_1.h5ad
+annslicer slice input.h5ad output_prefix --obs-column cell_type
+```
+
+```bash
+annslicer filter input.h5ad filtered.h5ad --obs-column keep
+```
+
+```bash
+annslicer merge output.h5ad shard_*.h5ad
 ```
 
 ## Features
 
-- Shards and merges `X`, all `layers`, `obs`, `var`, `obsm`, and `uns`
+- Shards, filters, and merges `X`, all `layers`, `obs`, `var`, `obsm`, and `uns`
 - Handles both dense and sparse (CSR) matrices
 - Constant, low memory footprint regardless of file size
-- Input supports both `.h5ad` and `.zarr` formats for slicing
+- Input supports both `.h5ad` and `.zarr` formats for slicing and filtering
 - Merge output supports both `.h5ad` and `.zarr` formats
-- Optional **cell shuffling** (`--shuffle`) for representative shards without loading the full matrix
+- **Fixed-size sharding** (`--size`) with optional random cell shuffling
+- **Categorical sharding** (`--obs-column`) — one shard per category value, named by category
+- **Always-include cells** — append control cells (e.g. non-targeting controls) to every shard
+- **Auxiliary CSV metadata** — provide extra `obs` columns from a CSV file without modifying the source
+- **Cell filtering** — keep only cells matching a boolean obs column, out-of-core
 - Simple CLI and Python API
 
 ## Installation
@@ -45,9 +57,15 @@ pip install annslicer[zarr]
 
 ## CLI Usage
 
-`annslicer` provides two subcommands: `slice` and `merge`.
+`annslicer` provides three subcommands: `slice`, `filter`, and `merge`.
 
 ### Sharding a large file
+
+`annslicer slice` supports two sharding modes: fixed-size (default) and categorical.
+
+#### Fixed-size sharding
+
+Split the file into equal-sized shards by cell count:
 
 ```bash
 annslicer slice input.h5ad output_prefix --size 10000
@@ -58,7 +76,7 @@ Both `.h5ad` and `.zarr` inputs are supported.
 | Argument | Description |
 |---|---|
 | `input.h5ad` or `input.zarr` | Path to the source file |
-| `output_prefix` | Prefix for output files (e.g. `atlas` → `atlas_shard001.h5ad`, …) |
+| `output_prefix` | Prefix for output files (e.g. `atlas` → `atlas_shard_0.h5ad`, …) |
 | `--size N` | Number of cells per shard (default: `10000`) |
 | `--shuffle` | Randomly assign cells to shards (each shard is a representative draw) |
 | `--seed N` | Random seed for reproducible shuffling (requires `--shuffle`) |
@@ -70,7 +88,7 @@ Both `.h5ad` and `.zarr` inputs are supported.
 annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 20000
 ```
 
-**Example — shuffled sharding from a large h5ad:**
+**Example — shuffled sharding:**
 
 ```bash
 annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 10000 --shuffle --seed 0
@@ -83,6 +101,77 @@ annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 10000 --compression
 ```
 
 Produces: `atlas_shard_0.h5ad`, `atlas_shard_1.h5ad`, …
+
+#### Categorical sharding by obs column
+
+Split cells into one shard per category value, named by the category:
+
+```bash
+annslicer slice input.h5ad output_prefix --obs-column cell_type
+```
+
+| Argument | Description |
+|---|---|
+| `--obs-column COLUMN` | Categorical obs column to partition on |
+| `--csv-file PATH` | Optional CSV file with extra per-cell metadata (see below) |
+| `--join-column COLUMN` | Column in the CSV to use as the cell-barcode key (default: first column) |
+| `--always-include VALUE [VALUE ...]` | Category values to copy into **every** shard (e.g. non-targeting controls); no dedicated file is written for these categories |
+| `--compression FILTER` | HDF5 compression filter; default: no compression |
+
+The `--obs-column` column must be a pandas `Categorical`. If the column comes from `--csv-file`, it is coerced to categorical automatically.
+
+**Example — shard a perturbation dataset by perturbation, including controls in every shard:**
+
+```bash
+annslicer slice perturb.h5ad /outputs/perturb \
+    --obs-column perturbation \
+    --always-include non-targeting
+```
+
+Produces: `perturb_KRAS.h5ad`, `perturb_TP53.h5ad`, … (one file per non-control perturbation, each containing the perturbation's cells plus all `non-targeting` cells).
+
+**Example — obs column from an auxiliary CSV:**
+
+```bash
+annslicer slice atlas.h5ad /outputs/atlas \
+    --obs-column tissue \
+    --csv-file metadata.csv
+```
+
+The CSV must contain one row per cell. Its first column (or `--join-column`) is matched to the h5ad obs index. All CSV columns are coerced to categorical.
+
+### Filtering cells
+
+Produce a single output file containing only cells for which a boolean obs column is `True`:
+
+```bash
+annslicer filter input.h5ad filtered.h5ad --obs-column keep
+```
+
+| Argument | Description |
+|---|---|
+| `input_file` | Path to the source `.h5ad` or `.zarr` file |
+| `output_file` | Path for the filtered output `.h5ad` file |
+| `--obs-column COLUMN` | *(required)* Column whose truthy values determine which cells to keep |
+| `--csv-file PATH` | Optional CSV file with extra per-cell metadata |
+| `--join-column COLUMN` | Column in the CSV to use as the cell-barcode key (default: first column) |
+| `--compression FILTER` | HDF5 compression filter; default: no compression |
+
+The filter column is interpreted leniently: `bool` dtype is used directly; numeric columns treat non-zero as `True`; string columns accept `"true"`/`"false"`/`"1"`/`"0"` (case-insensitive).
+
+**Example — filter using a pre-existing obs column:**
+
+```bash
+annslicer filter atlas.h5ad atlas_qc_pass.h5ad --obs-column qc_pass
+```
+
+**Example — filter using a column from an auxiliary CSV:**
+
+```bash
+annslicer filter atlas.h5ad atlas_filtered.h5ad \
+    --obs-column keep \
+    --csv-file cell_flags.csv
+```
 
 ### Merging shards back into one file
 
@@ -119,7 +208,9 @@ When shards have **different gene sets**, `--join outer` (default) takes the uni
 ## Python API
 
 ```python
-from annslicer import shard_h5ad, merge_out_of_core
+from annslicer import shard_h5ad, shard_by_obs_column, filter_h5ad, merge_out_of_core
+
+# --- Fixed-size sharding ---
 
 # Basic sharding (h5ad or zarr input)
 shard_h5ad("large_atlas.h5ad", "atlas", shard_size=20000)
@@ -139,6 +230,38 @@ shard_h5ad(
     output_filenames=["batch_0.h5ad", "batch_1.h5ad", "batch_2.h5ad"],
 )
 
+# --- Categorical sharding by obs column ---
+
+# Shard by a categorical obs column — one file per category, named by category value
+shard_by_obs_column("atlas.h5ad", "atlas", obs_column="tissue")
+# Produces: atlas_brain.h5ad, atlas_liver.h5ad, atlas_lung.h5ad, …
+
+# Perturbation dataset — include control cells in every shard
+shard_by_obs_column(
+    "perturb.h5ad",
+    "perturb",
+    obs_column="perturbation",
+    always_include=["non-targeting"],
+)
+
+# Obs column from an auxiliary CSV (coerced to categorical automatically)
+shard_by_obs_column(
+    "atlas.h5ad",
+    "atlas",
+    obs_column="tissue",
+    csv_file="metadata.csv",  # first column matched to obs index
+)
+
+# --- Filtering ---
+
+# Keep only cells where obs column is truthy (bool, 0/1, or 'True'/'False' strings)
+filter_h5ad("atlas.h5ad", "atlas_qc.h5ad", obs_column="qc_pass")
+
+# Filter using a boolean column from an auxiliary CSV
+filter_h5ad("atlas.h5ad", "atlas_filtered.h5ad", obs_column="keep", csv_file="flags.csv")
+
+# --- Merging ---
+
 # Merge shards back into one file (identical-var fast path used automatically)
 merge_out_of_core(["atlas_shard_0.h5ad", "atlas_shard_1.h5ad"], "merged.h5ad")
 
@@ -151,12 +274,25 @@ merge_out_of_core(["shard_a.h5ad", "shard_b.h5ad"], "merged.h5ad", join="inner")
 
 ## How it works
 
-### Slicing
+### Fixed-size slicing
 1. Opens the input file ("backed" AnnData for `.h5ad`; `anndata.io.sparse_dataset` for `.zarr`).
 2. If `shuffle=True`, generates a global cell permutation upfront using `numpy.random.default_rng`.
 3. For each shard, reads only the relevant rows from `X` and each layer via sorted fancy indexing — no full matrix is ever loaded into memory.
 4. When shuffling, rows are read in sorted index order (maximising sequential I/O) and then reordered in-memory to the desired shuffled order.
 5. Reassembles a valid `AnnData` object per shard and writes it to disk.
+
+### Categorical slicing
+1. Opens the input file in the same backed/lazy mode as fixed-size slicing.
+2. If `--csv-file` is provided, reads the CSV and merges it into `adata.obs` in memory (the backing file is never written to). All new columns are coerced to categorical.
+3. Validates that the target column is categorical. Validates that any `--always-include` values exist in the category list.
+4. Sanitises category names to safe filename fragments (`re.sub(r'[^\w.-]', '_', name)`); raises an error if two names collide after sanitisation.
+5. For each non-always-include category: collects cell indices via `numpy.where`, appends always-include indices, sorts for sequential I/O, then writes. Empty categories are skipped with a warning.
+
+### Filtering
+1. Opens the input file in backed/lazy mode.
+2. Optionally merges an auxiliary CSV into `adata.obs` (same merge logic as categorical slicing).
+3. Reads the filter column and coerces it to boolean leniently (bool → direct; numeric → non-zero; string → `'true'`/`'false'`/`'1'`/`'0'`).
+4. Collects the indices of cells where the column is `True` and writes them to a new file.
 
 ### Merging
 1. Reads `obs`, `var`, and `uns` from **all** shards to build a skeleton output file.

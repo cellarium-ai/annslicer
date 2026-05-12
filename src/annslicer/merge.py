@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from anndata.io import read_elem
 
-from annslicer._store import _is_sparse_group, _require_zarr, open_store
+from annslicer._store import _is_sparse_group, _require_zarr, _store_create_array, open_store
 
 logger = logging.getLogger(__name__)
 
@@ -354,10 +354,12 @@ def merge_out_of_core(
         grp.attrs["shape"] = [int(total_cells), int(num_genes)]
 
         chunk_size = (min(total_nnz, 1_000_000),)
-        grp.create_dataset("data", shape=(total_nnz,), chunks=chunk_size, dtype=np.float32)
-        grp.create_dataset("indices", shape=(total_nnz,), chunks=chunk_size, dtype=np.int32)
+        _store_create_array(grp, "data", shape=(total_nnz,), chunks=chunk_size, dtype=np.float32)
+        _store_create_array(grp, "indices", shape=(total_nnz,), chunks=chunk_size, dtype=np.int32)
         indptr_chunk = (min(total_cells + 1, 100_000),)
-        grp.create_dataset("indptr", shape=(total_cells + 1,), chunks=indptr_chunk, dtype=np.int64)
+        _store_create_array(
+            grp, "indptr", shape=(total_cells + 1,), chunks=indptr_chunk, dtype=np.int64
+        )
 
     if "X" in matrix_nnz:
         allocate_sparse("X", matrix_nnz["X"])
@@ -366,7 +368,8 @@ def merge_out_of_core(
         if "X" in out_store:
             del out_store["X"]
         chunk_rows = min(total_cells, 1_000)
-        ds = out_store.create_dataset(
+        ds = _store_create_array(
+            out_store,
             "X",
             shape=(total_cells, num_genes),
             chunks=(chunk_rows, num_genes),
@@ -392,8 +395,12 @@ def merge_out_of_core(
             if key in grp_obsm:
                 del grp_obsm[key]
             obsm_chunk_rows = min(total_cells, 10_000)
-            grp_obsm.create_dataset(
-                key, shape=(total_cells, dim), chunks=(obsm_chunk_rows, dim), dtype=np.float32
+            _store_create_array(
+                grp_obsm,
+                key,
+                shape=(total_cells, dim),
+                chunks=(obsm_chunk_rows, dim),
+                dtype=np.float32,
             )
 
     # Streaming loop

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 
+from annslicer import filter as filter_mod
 from annslicer import merge, slice
 
 
@@ -36,6 +37,7 @@ def main() -> None:
 
     slice.register_subcommand(subparsers)
     merge.register_subcommand(subparsers)
+    filter_mod.register_subcommand(subparsers)
 
     args = parser.parse_args()
 
