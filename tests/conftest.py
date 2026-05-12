@@ -111,9 +111,7 @@ def synthetic_csv_categorical(tmp_path_factory: pytest.TempPathFactory) -> str:
     """
     import csv
 
-    rows = [["cell_id", "cell_type"]] + [
-        [f"cell_{i}", f"type_{i % 3}"] for i in range(N_CELLS)
-    ]
+    rows = [["cell_id", "cell_type"]] + [[f"cell_{i}", f"type_{i % 3}"] for i in range(N_CELLS)]
     out_dir = tmp_path_factory.mktemp("csv_data")
     csv_path = str(out_dir / "cell_types.csv")
     with open(csv_path, "w", newline="") as f:
@@ -132,9 +130,7 @@ def synthetic_csv_bool(tmp_path_factory: pytest.TempPathFactory) -> str:
     """
     import csv
 
-    rows = [["cell_id", "keep"]] + [
-        [f"cell_{i}", i < 100] for i in range(N_CELLS)
-    ]
+    rows = [["cell_id", "keep"]] + [[f"cell_{i}", i < 100] for i in range(N_CELLS)]
     out_dir = tmp_path_factory.mktemp("csv_bool_data")
     csv_path = str(out_dir / "keep_flags.csv")
     with open(csv_path, "w", newline="") as f:

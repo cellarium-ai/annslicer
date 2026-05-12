@@ -12,8 +12,8 @@ from __future__ import annotations
 import argparse
 import logging
 
-from annslicer import merge, slice
 from annslicer import filter as filter_mod
+from annslicer import merge, slice
 
 
 def main() -> None:

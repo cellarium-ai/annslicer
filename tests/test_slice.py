@@ -456,7 +456,6 @@ def test_obs_shard_sanitized_name_collision_raises(tmp_path):
     """ValueError when two category names sanitize to the same filename fragment."""
     import anndata as ad_mod
     import pandas as pd
-    import scipy.sparse as sp_mod
 
     rng = np.random.default_rng(0)
     # "foo bar" and "foo_bar" both sanitize to "foo_bar"

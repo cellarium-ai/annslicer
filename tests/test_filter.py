@@ -8,8 +8,6 @@ import csv
 from pathlib import Path
 
 import anndata as ad
-import numpy as np
-import pandas as pd
 import pytest
 
 from annslicer.filter import filter_h5ad
@@ -124,8 +122,9 @@ def test_filter_csv_missing_cells_raises(synthetic_h5ad, tmp_path):
             writer.writerow([f"cell_{i}", True])
 
     with pytest.raises(ValueError, match="missing"):
-        filter_h5ad(synthetic_h5ad, str(tmp_path / "out.h5ad"), obs_column="keep",
-                    csv_file=partial_csv)
+        filter_h5ad(
+            synthetic_h5ad, str(tmp_path / "out.h5ad"), obs_column="keep", csv_file=partial_csv
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +134,6 @@ def test_filter_csv_missing_cells_raises(synthetic_h5ad, tmp_path):
 
 def test_filter_zarr_input(synthetic_zarr, tmp_path):
     """filter_h5ad works with a zarr input."""
-    import anndata as ad_mod
     import anndata
 
     # zarr doesn't have a backed mode for writing only a subset of obs easily;

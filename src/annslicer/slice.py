@@ -299,7 +299,7 @@ def _shard_by_obs_column_store(
     # --- Sanitize names and check for collisions ---
     shard_categories = [c for c in categories if c not in always_include_set]
     safe_names: dict[str, str] = {}  # category -> safe filename fragment
-    seen_safe: dict[str, str] = {}   # safe name -> original category (for collision detection)
+    seen_safe: dict[str, str] = {}  # safe name -> original category (for collision detection)
     for cat in shard_categories:
         safe = re.sub(r"[^\w.-]", "_", str(cat))
         if safe in seen_safe:
