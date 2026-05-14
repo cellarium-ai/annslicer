@@ -74,19 +74,24 @@ def _write_shard_from_indices(
 def _merge_csv_into_obs(
     obs_df: pd.DataFrame,
     csv_file: str,
+    obs_column: str,
     join_column: str | None = None,
 ) -> pd.DataFrame:
     """
-    Read an auxiliary CSV file and left-join its columns onto an obs DataFrame.
+    Read a single column from an auxiliary CSV file and merge it into an obs DataFrame.
+
+    Only ``obs_column`` is taken from the CSV — no other columns are touched.
+    If ``obs_column`` already exists in ``obs_df`` it is overwritten with the
+    CSV value, which allows the same CSV to be used across multiple commands
+    (e.g. ``filter`` followed by ``slice``) without collision errors.
 
     The CSV is joined on the obs index (cell barcodes).  By default the CSV's
     first column is used as the join key (treated as the cell barcode index).
     Pass ``join_column`` to use a named column instead.
 
-    After joining, any column whose dtype is not already categorical is coerced
-    to ``pd.CategoricalDtype``.  This ensures that columns sourced from a CSV
-    (which are typically read as plain strings or numbers) behave correctly when
-    used as the ``obs_column`` argument to :func:`shard_by_obs_column`.
+    The merged column is coerced to ``pd.CategoricalDtype`` so that it can be
+    used directly as the ``obs_column`` argument to :func:`shard_by_obs_column`
+    without requiring the user to pre-cast it.
 
     Parameters
     ----------
@@ -94,17 +99,21 @@ def _merge_csv_into_obs(
         The existing ``adata.obs`` DataFrame (index = cell barcodes).
     csv_file:
         Path to the CSV file containing additional per-cell metadata.
+    obs_column:
+        The single column from the CSV to merge into obs.
     join_column:
-        Name of the column in the CSV to use as the join key.  If ``None``,
+        Column in the CSV to use as the cell-barcode join key.  If ``None``,
         the first column is used.
 
     Returns
     -------
     pd.DataFrame
-        A new obs DataFrame with the CSV columns appended.
+        A new obs DataFrame with ``obs_column`` added (or overwritten).
 
     Raises
     ------
+    KeyError
+        If ``obs_column`` is not present as a column in the CSV.
     ValueError
         If any cell barcode present in ``obs_df`` is absent from the CSV.
     """
@@ -114,6 +123,16 @@ def _merge_csv_into_obs(
         csv_df = csv_df.set_index(join_column)
     else:
         csv_df = csv_df.set_index(csv_df.columns[0])
+
+    # Validate that the requested column exists in the CSV.
+    if obs_column not in csv_df.columns:
+        raise KeyError(
+            f"Column {obs_column!r} not found in CSV file {csv_file!r}. "
+            f"Available columns: {list(csv_df.columns)}."
+        )
+
+    # Restrict to only the one column we need.
+    csv_df = csv_df[[obs_column]]
 
     # Normalise the CSV index to plain Python strings.
     #
@@ -142,12 +161,16 @@ def _merge_csv_into_obs(
             f"Ensure the CSV contains a row for every cell in the input file."
         )
 
-    # Coerce all non-categorical columns in the CSV portion to CategoricalDtype so
-    # that string/int columns from a CSV can be used directly as obs_column for
-    # shard_by_obs_column without requiring the user to pre-cast the column.
-    for col in csv_df.columns:
-        if not isinstance(csv_df[col].dtype, pd.CategoricalDtype):
-            csv_df[col] = csv_df[col].astype("category")
+    # Coerce to CategoricalDtype so the column can be used directly by
+    # shard_by_obs_column without requiring the caller to pre-cast it.
+    if not isinstance(csv_df[obs_column].dtype, pd.CategoricalDtype):
+        csv_df[obs_column] = csv_df[obs_column].astype("category")
+
+    # Drop the column from obs_df if it already exists so the join does not
+    # produce duplicate column names (e.g. when the same CSV is reused across
+    # a filter run followed by a slice run on the resulting file).
+    if obs_column in obs_df.columns:
+        obs_df = obs_df.drop(columns=[obs_column])
 
     # Join on the normalised string index; restore the original index object
     # afterwards so the returned DataFrame has the same index dtype as the input.

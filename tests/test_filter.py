@@ -194,3 +194,114 @@ def test_filter_bool_invalid_strings_raise(synthetic_h5ad, tmp_path):
 
     with pytest.raises(ValueError, match="cannot be interpreted as boolean"):
         filter_h5ad(alt, str(tmp_path / "out.h5ad"), obs_column="keep_bad")
+
+
+# ---------------------------------------------------------------------------
+# Column-scoped CSV merge
+# ---------------------------------------------------------------------------
+
+
+def test_filter_csv_column_not_in_csv_raises(synthetic_h5ad, synthetic_csv_bool, tmp_path):
+    """KeyError when --obs-column names a column absent from the CSV."""
+    with pytest.raises(KeyError, match="nonexistent"):
+        filter_h5ad(
+            synthetic_h5ad,
+            str(tmp_path / "out.h5ad"),
+            obs_column="nonexistent",
+            csv_file=synthetic_csv_bool,
+        )
+
+
+def test_filter_csv_overwrites_existing_obs_column(synthetic_h5ad, synthetic_csv_bool, tmp_path):
+    """CSV column silently overwrites a pre-existing obs column of the same name."""
+    import anndata as ad_mod
+
+    # Add a 'keep' column to obs where ALL cells are False (i.e. would keep nothing)
+    adata = ad_mod.read_h5ad(synthetic_h5ad)
+    adata.obs["keep"] = False
+    with_keep = str(tmp_path / "with_false_keep.h5ad")
+    adata.write_h5ad(with_keep)
+
+    # synthetic_csv_bool has keep=True for first 100 cells — CSV should win
+    out = str(tmp_path / "filtered.h5ad")
+    filter_h5ad(with_keep, out, obs_column="keep", csv_file=synthetic_csv_bool)
+    result = ad.read_h5ad(out)
+    assert result.n_obs == N_KEEP, "CSV 'keep' should overwrite the all-False obs column"
+
+
+# ---------------------------------------------------------------------------
+# filter → slice integration (same CSV reused across both commands)
+# ---------------------------------------------------------------------------
+
+
+def test_filter_then_slice_same_csv(
+    synthetic_h5ad, synthetic_csv_bool, synthetic_csv_categorical, tmp_path
+):
+    """
+    filter_h5ad + shard_by_obs_column can use different columns from different
+    CSVs in sequence without column-collision errors.
+
+    Workflow:
+      1. filter using synthetic_csv_bool  → filtered.h5ad  (adds 'keep' to obs)
+      2. shard  using synthetic_csv_categorical → shards (adds 'cell_type' to obs)
+    """
+    from annslicer.slice import shard_by_obs_column
+
+    filtered = str(tmp_path / "filtered.h5ad")
+    filter_h5ad(synthetic_h5ad, filtered, obs_column="keep", csv_file=synthetic_csv_bool)
+    assert ad.read_h5ad(filtered).n_obs == N_KEEP
+
+    # The filtered file now has 'keep' in obs; shard it by cell_type from the CSV.
+    # cell_type is also already present in obs of synthetic_h5ad (and therefore
+    # the filtered file) — the CSV overwrite path must not error.
+    shard_by_obs_column(
+        filtered,
+        str(tmp_path / "shard"),
+        obs_column="cell_type",
+        csv_file=synthetic_csv_categorical,
+    )
+    shard_files = list(tmp_path.glob("shard_*.h5ad"))
+    assert len(shard_files) == 3  # type_0, type_1, type_2
+
+    all_cells: list[str] = []
+    for p in shard_files:
+        all_cells.extend(ad.read_h5ad(p).obs_names.tolist())
+    assert len(set(all_cells)) == N_KEEP  # all kept cells appear exactly once
+
+
+def test_filter_then_slice_same_csv_file(synthetic_h5ad, synthetic_csv_categorical, tmp_path):
+    """
+    The exact failure case from the issue: same CSV used for filter and then slice.
+
+    synthetic_csv_categorical has columns: cell_id (index), cell_type.
+    We use cell_type as obs_column for both steps.
+    After filtering the output has cell_type in obs; slicing with the same CSV
+    must overwrite it without raising a column-collision error.
+    """
+    # Step 1: filter — keep the first 100 cells using cell_type from CSV as a
+    # stand-in (won't be bool, so we need an actual bool column).  Build a
+    # single CSV that has both 'cell_type' and 'keep' so we can reuse it.
+    import csv as csv_mod
+
+    from annslicer.slice import shard_by_obs_column
+
+    combo_csv = str(tmp_path / "combo.csv")
+    with open(combo_csv, "w", newline="") as f:
+        writer = csv_mod.writer(f)
+        writer.writerow(["cell_id", "cell_type", "keep"])
+        for i in range(N_CELLS):
+            writer.writerow([f"cell_{i}", f"type_{i % 3}", str(i < N_KEEP).lower()])
+
+    filtered = str(tmp_path / "filtered.h5ad")
+    filter_h5ad(synthetic_h5ad, filtered, obs_column="keep", csv_file=combo_csv)
+    assert ad.read_h5ad(filtered).n_obs == N_KEEP
+
+    # Step 2: slice using the SAME CSV file, different obs_column — must not error.
+    shard_by_obs_column(
+        filtered,
+        str(tmp_path / "shard"),
+        obs_column="cell_type",
+        csv_file=combo_csv,
+    )
+    shard_files = list(tmp_path.glob("shard_*.h5ad"))
+    assert len(shard_files) == 3
