@@ -7,6 +7,7 @@ Used by both ``slice.py`` and ``filter.py`` to avoid code duplication.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import anndata as ad
@@ -19,6 +20,13 @@ logger = logging.getLogger(__name__)
 def _unwrap(arr: np.ndarray) -> Any:
     """Unwrap the 0-d object array that h5py sometimes returns for backed sparse layers."""
     return arr.item() if isinstance(arr, np.ndarray) and arr.ndim == 0 else arr
+
+
+def _ensure_parent_dir(output_prefix: str) -> None:
+    """Create the parent directory of *output_prefix* if it does not already exist."""
+    parent = os.path.dirname(output_prefix)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def _write_shard_from_indices(

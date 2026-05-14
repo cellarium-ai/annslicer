@@ -13,7 +13,12 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-from annslicer._common import _merge_csv_into_obs, _unwrap, _write_shard_from_indices
+from annslicer._common import (
+    _ensure_parent_dir,
+    _merge_csv_into_obs,
+    _unwrap,
+    _write_shard_from_indices,
+)
 from annslicer._store import _require_zarr
 
 logger = logging.getLogger(__name__)
@@ -101,6 +106,8 @@ def shard_h5ad(
         e.g. ``"gzip"`` or ``"lzf"``.  ``None`` (default) writes
         uncompressed files, which is fastest for downstream streaming reads.
     """
+    _ensure_parent_dir(output_prefix)
+
     if input_file.endswith(".zarr"):
         logger.info("Opening zarr store %s in backed mode via sparse_dataset...", input_file)
         adata = _open_zarr_backed(input_file)
@@ -231,6 +238,8 @@ def shard_by_obs_column(
     compression:
         HDF5 compression filter for output files (e.g. ``"gzip"``).
     """
+    _ensure_parent_dir(output_prefix)
+
     if input_file.endswith(".zarr"):
         logger.info("Opening zarr store %s in backed mode via sparse_dataset...", input_file)
         adata = _open_zarr_backed(input_file)

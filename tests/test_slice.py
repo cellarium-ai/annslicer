@@ -493,3 +493,19 @@ def test_obs_shard_sanitized_name_collision_raises(tmp_path):
 
     with pytest.raises(ValueError, match="sanitize"):
         shard_by_obs_column(h5ad, str(tmp_path / "out"), "grp")
+
+
+def test_shard_h5ad_creates_output_dir(synthetic_h5ad, tmp_path):
+    """shard_h5ad creates the output directory if it does not exist."""
+    out_prefix = str(tmp_path / "new_subdir" / "out")
+    shard_h5ad(synthetic_h5ad, out_prefix, shard_size=50)
+    assert (tmp_path / "new_subdir").is_dir()
+    assert any((tmp_path / "new_subdir").iterdir())
+
+
+def test_shard_by_obs_column_creates_output_dir(synthetic_h5ad, tmp_path):
+    """shard_by_obs_column creates the output directory if it does not exist."""
+    out_prefix = str(tmp_path / "new_subdir" / "out")
+    shard_by_obs_column(synthetic_h5ad, out_prefix, "cell_type")
+    assert (tmp_path / "new_subdir").is_dir()
+    assert any((tmp_path / "new_subdir").iterdir())
