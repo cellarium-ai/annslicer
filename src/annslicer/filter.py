@@ -86,7 +86,7 @@ def _filter_store(
     """Core logic for :func:`filter_h5ad` operating on an open AnnData."""
     # --- Merge auxiliary CSV into obs if provided ---
     if csv_file is not None:
-        adata.obs = _merge_csv_into_obs(adata.obs, csv_file, join_column)
+        adata.obs = _merge_csv_into_obs(adata.obs, csv_file, obs_column, join_column)
 
     col = adata.obs[obs_column]
 

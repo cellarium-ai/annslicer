@@ -9,6 +9,7 @@ from pathlib import Path
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 import pytest
 import scipy.sparse as sp
 
@@ -387,6 +388,31 @@ def test_obs_shard_csv_merge(synthetic_h5ad, synthetic_csv_categorical, tmp_path
     for path in files:
         all_cells.extend(ad.read_h5ad(path).obs_names.tolist())
     assert len(set(all_cells)) == N_CELLS
+
+
+def test_obs_shard_csv_overwrites_existing_column(
+    synthetic_h5ad, synthetic_csv_categorical, tmp_path
+):
+    """CSV silently overwrites an existing obs column of the same name."""
+    import anndata as ad_mod
+
+    # Corrupt the built-in cell_type so every cell reports "wrong"
+    adata = ad_mod.read_h5ad(synthetic_h5ad)
+    adata.obs["cell_type"] = pd.Categorical(["wrong"] * N_CELLS)
+    corrupted = str(tmp_path / "corrupted.h5ad")
+    adata.write_h5ad(corrupted)
+
+    # CSV has the correct values — must overwrite without error
+    shard_by_obs_column(
+        corrupted,
+        str(tmp_path / "out"),
+        "cell_type",
+        csv_file=synthetic_csv_categorical,
+    )
+    files = list(tmp_path.glob("out_*.h5ad"))
+    # If the overwrite worked we get 3 shards (type_0/1/2); if it kept "wrong"
+    # we would get 0 shards (no matching non-always-include categories).
+    assert len(files) == len(CATEGORIES)
 
 
 def test_obs_shard_csv_missing_cells_raises(synthetic_h5ad, tmp_path):

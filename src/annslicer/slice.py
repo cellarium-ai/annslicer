@@ -265,7 +265,7 @@ def _shard_by_obs_column_store(
     """Core logic for :func:`shard_by_obs_column` operating on an open AnnData."""
     # --- Merge auxiliary CSV into obs if provided ---
     if csv_file is not None:
-        adata.obs = _merge_csv_into_obs(adata.obs, csv_file, join_column)
+        adata.obs = _merge_csv_into_obs(adata.obs, csv_file, obs_column, join_column)
 
     # --- Validate obs_column is categorical ---
     if obs_column not in adata.obs.columns:
