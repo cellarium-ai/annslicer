@@ -390,6 +390,265 @@ def test_invalid_join_raises(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Unsorted var_names regression tests
+# ---------------------------------------------------------------------------
+#
+# The join tests above use gene names (g0000…g0049) that happen to be in
+# alphabetical order within each shard.  Because Index.union/.intersection
+# return a *sorted* index, those shards produce a monotonically increasing
+# column remap and never exercise the reordering path.
+#
+# Real gene lists are not alphabetically sorted.  When they are not, the remap
+# is non-monotonic, which
+#   * raises "Indexing elements must be in increasing order" from h5py when X
+#     is dense (h5py fancy indexing requires a strictly increasing selection),
+#   * silently writes non-canonical CSR (unsorted column indices within a row)
+#     when X is sparse.
+#
+# Shard order below is deliberately anti-alphabetical.  Note that .union()
+# sorts but .intersection() preserves the calling index's order, so shard B
+# lists the two shared genes in the opposite relative order from shard A to
+# make the inner-join remap non-monotonic as well:
+#
+#   union ['GeneA','GeneM','GeneQ','GeneZ']  remap A [3,1,0]   remap B [0,2,1]
+#   inner ['GeneM','GeneA']                  sel A   [0,1]     sel B   [1,0]
+_UNSORTED_GENES_A = ["GeneZ", "GeneM", "GeneA"]
+_UNSORTED_GENES_B = ["GeneA", "GeneQ", "GeneM"]
+_UNSORTED_UNION = ["GeneA", "GeneM", "GeneQ", "GeneZ"]
+_UNSORTED_INTERSECTION = ["GeneM", "GeneA"]
+
+# Distinct values so that a wrong column permutation cannot pass by accident;
+# the embedded zeros give the sparse shards a different nnz per row.
+_UNSORTED_X_A = np.array([[1.0, 2.0, 3.0], [4.0, 0.0, 6.0]], dtype=np.float32)
+_UNSORTED_X_B = np.array([[7.0, 8.0, 11.0], [0.0, 9.0, 10.0]], dtype=np.float32)
+
+
+def _make_named_shard(
+    tmp_path: Path,
+    name: str,
+    gene_names: list[str],
+    X: np.ndarray,
+    *,
+    sparse: bool,
+) -> str:
+    """Write a shard with an explicit gene order and explicit X values."""
+    adata = ad.AnnData(
+        X=sp.csr_matrix(X) if sparse else X.copy(),
+        obs=pd.DataFrame(index=[f"{name}_cell{i}" for i in range(X.shape[0])]),
+        var=pd.DataFrame(index=gene_names),
+    )
+    path = str(tmp_path / f"{name}.h5ad")
+    adata.write_h5ad(path)
+    return path
+
+
+def _expected_by_gene_name(
+    shards: list[tuple[list[str], np.ndarray]], merged_genes: list[str]
+) -> np.ndarray:
+    """Build the expected merged matrix by gene-name lookup, independent of merge.py."""
+    blocks = []
+    for gene_names, X in shards:
+        pos = {g: j for j, g in enumerate(gene_names)}
+        block = np.zeros((X.shape[0], len(merged_genes)), dtype=np.float32)
+        for k, gene in enumerate(merged_genes):
+            if gene in pos:
+                block[:, k] = X[:, pos[gene]]
+        blocks.append(block)
+    return np.vstack(blocks)
+
+
+def _assert_csr_indices_sorted(path: str, group: str = "X") -> None:
+    """Assert the on-disk CSR has strictly increasing column indices in every row."""
+    with h5py.File(path, "r") as f:
+        indices = f[group]["indices"][:]
+        indptr = f[group]["indptr"][:]
+    for row in range(len(indptr) - 1):
+        row_indices = indices[indptr[row] : indptr[row + 1]]
+        assert np.all(np.diff(row_indices) > 0), (
+            f"row {row} of '{group}' has non-canonical CSR column indices: {row_indices}"
+        )
+
+
+@pytest.fixture()
+def unsorted_dense_pair(tmp_path: Path) -> tuple[str, str]:
+    path_a = _make_named_shard(
+        tmp_path, "unsorted_A", _UNSORTED_GENES_A, _UNSORTED_X_A, sparse=False
+    )
+    path_b = _make_named_shard(
+        tmp_path, "unsorted_B", _UNSORTED_GENES_B, _UNSORTED_X_B, sparse=False
+    )
+    return path_a, path_b
+
+
+@pytest.fixture()
+def unsorted_sparse_pair(tmp_path: Path) -> tuple[str, str]:
+    path_a = _make_named_shard(tmp_path, "sp_A", _UNSORTED_GENES_A, _UNSORTED_X_A, sparse=True)
+    path_b = _make_named_shard(tmp_path, "sp_B", _UNSORTED_GENES_B, _UNSORTED_X_B, sparse=True)
+    return path_a, path_b
+
+
+def test_outer_join_unsorted_var_dense_x(
+    unsorted_dense_pair: tuple[str, str], tmp_path: Path
+) -> None:
+    """Dense X + outer join + non-alphabetical shard var order must not raise.
+
+    Regression test for the reported crash:
+    ``TypeError: Indexing elements must be in increasing order``.
+    """
+    path_a, path_b = unsorted_dense_pair
+    out = str(tmp_path / "unsorted_outer.h5ad")
+    merge_out_of_core([path_a, path_b], out, join="outer")
+
+    merged = ad.read_h5ad(out)
+    assert list(merged.var_names) == _UNSORTED_UNION
+    expected = _expected_by_gene_name(
+        [(_UNSORTED_GENES_A, _UNSORTED_X_A), (_UNSORTED_GENES_B, _UNSORTED_X_B)],
+        _UNSORTED_UNION,
+    )
+    np.testing.assert_array_almost_equal(_to_dense(merged.X), expected)
+
+
+def test_inner_join_unsorted_var_dense_x(
+    unsorted_dense_pair: tuple[str, str], tmp_path: Path
+) -> None:
+    """Dense X + inner join hits the same non-monotonic selection via remap[valid]."""
+    path_a, path_b = unsorted_dense_pair
+    out = str(tmp_path / "unsorted_inner.h5ad")
+    merge_out_of_core([path_a, path_b], out, join="inner")
+
+    merged = ad.read_h5ad(out)
+    assert list(merged.var_names) == _UNSORTED_INTERSECTION
+    expected = _expected_by_gene_name(
+        [(_UNSORTED_GENES_A, _UNSORTED_X_A), (_UNSORTED_GENES_B, _UNSORTED_X_B)],
+        _UNSORTED_INTERSECTION,
+    )
+    np.testing.assert_array_almost_equal(_to_dense(merged.X), expected)
+
+
+def test_outer_join_unsorted_var_sparse_is_canonical_csr(
+    unsorted_sparse_pair: tuple[str, str], tmp_path: Path
+) -> None:
+    """Sparse outer join must write canonical CSR (sorted indices within each row)."""
+    path_a, path_b = unsorted_sparse_pair
+    out = str(tmp_path / "unsorted_outer_sparse.h5ad")
+    merge_out_of_core([path_a, path_b], out, join="outer")
+
+    _assert_csr_indices_sorted(out, "X")
+
+    merged = ad.read_h5ad(out)
+    assert merged.X.has_sorted_indices
+    expected = _expected_by_gene_name(
+        [(_UNSORTED_GENES_A, _UNSORTED_X_A), (_UNSORTED_GENES_B, _UNSORTED_X_B)],
+        _UNSORTED_UNION,
+    )
+    np.testing.assert_array_almost_equal(_to_dense(merged.X), expected)
+
+
+def test_inner_join_unsorted_var_sparse_is_canonical_csr(
+    unsorted_sparse_pair: tuple[str, str], tmp_path: Path
+) -> None:
+    """Sparse inner join must also write canonical CSR."""
+    path_a, path_b = unsorted_sparse_pair
+    out = str(tmp_path / "unsorted_inner_sparse.h5ad")
+    merge_out_of_core([path_a, path_b], out, join="inner")
+
+    _assert_csr_indices_sorted(out, "X")
+
+    merged = ad.read_h5ad(out)
+    assert merged.X.has_sorted_indices
+    expected = _expected_by_gene_name(
+        [(_UNSORTED_GENES_A, _UNSORTED_X_A), (_UNSORTED_GENES_B, _UNSORTED_X_B)],
+        _UNSORTED_INTERSECTION,
+    )
+    np.testing.assert_array_almost_equal(_to_dense(merged.X), expected)
+
+
+def test_outer_join_unsorted_var_dense_x_zarr(
+    unsorted_dense_pair: tuple[str, str], tmp_path: Path
+) -> None:
+    """The same merge to a zarr output stays correct after the reordering fix."""
+    pytest.importorskip("zarr", reason="zarr not installed")
+
+    path_a, path_b = unsorted_dense_pair
+    out = str(tmp_path / "unsorted_outer.zarr")
+    merge_out_of_core([path_a, path_b], out, join="outer")
+
+    merged = ad.read_zarr(out)
+    assert list(merged.var_names) == _UNSORTED_UNION
+    expected = _expected_by_gene_name(
+        [(_UNSORTED_GENES_A, _UNSORTED_X_A), (_UNSORTED_GENES_B, _UNSORTED_X_B)],
+        _UNSORTED_UNION,
+    )
+    np.testing.assert_array_almost_equal(_to_dense(merged.X), expected)
+
+
+def test_duplicate_var_names_raises(tmp_path: Path) -> None:
+    """Duplicate gene names in a remapped shard must fail early with a clear message."""
+    path_a = _make_named_shard(
+        tmp_path,
+        "dup_A",
+        ["GeneZ", "GeneA", "GeneA"],
+        np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
+        sparse=False,
+    )
+    path_b = _make_named_shard(
+        tmp_path,
+        "dup_B",
+        ["GeneQ", "GeneA"],
+        np.array([[4.0, 5.0]], dtype=np.float32),
+        sparse=False,
+    )
+    out = str(tmp_path / "dup.h5ad")
+    with pytest.raises(ValueError, match="duplicate var_names"):
+        merge_out_of_core([path_a, path_b], out, join="outer")
+
+
+def test_duplicate_var_names_error_names_the_shard(tmp_path: Path) -> None:
+    """The duplicate-var_names error identifies the offending shard and gene."""
+    path_a = _make_named_shard(
+        tmp_path,
+        "clean_A",
+        ["GeneZ", "GeneA"],
+        np.array([[1.0, 2.0]], dtype=np.float32),
+        sparse=False,
+    )
+    path_b = _make_named_shard(
+        tmp_path,
+        "dirty_B",
+        ["GeneQ", "GeneQ"],
+        np.array([[4.0, 5.0]], dtype=np.float32),
+        sparse=False,
+    )
+    out = str(tmp_path / "dup2.h5ad")
+    with pytest.raises(ValueError) as excinfo:
+        merge_out_of_core([path_a, path_b], out, join="outer")
+
+    message = str(excinfo.value)
+    assert "dirty_B" in message
+    assert "GeneQ" in message
+    assert "var_names_make_unique" in message
+
+
+def test_duplicate_var_names_allowed_on_identity_fast_path(tmp_path: Path) -> None:
+    """Identical vars need no remapping, so duplicates stay a plain concat (no raise)."""
+    genes = ["GeneZ", "GeneA", "GeneA"]
+    path_a = _make_named_shard(
+        tmp_path, "same_A", genes, np.array([[1.0, 2.0, 3.0]], dtype=np.float32), sparse=False
+    )
+    path_b = _make_named_shard(
+        tmp_path, "same_B", genes, np.array([[4.0, 5.0, 6.0]], dtype=np.float32), sparse=False
+    )
+    out = str(tmp_path / "dup_identity.h5ad")
+    merge_out_of_core([path_a, path_b], out)  # must not raise
+
+    merged = ad.read_h5ad(out)
+    assert list(merged.var_names) == genes
+    np.testing.assert_array_almost_equal(
+        _to_dense(merged.X), np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI glob expansion test
 # ---------------------------------------------------------------------------
 

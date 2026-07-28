@@ -22,8 +22,37 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _is_increasing(a: np.ndarray) -> bool:
+    """True when *a* is strictly increasing (the selection order h5py requires)."""
+    return bool(a.size < 2 or np.all(np.diff(a) > 0))
+
+
+def _sort_indices_within_rows(
+    indices: np.ndarray, data: np.ndarray, row_nnz: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Restore the canonical CSR invariant of ascending column indices per row.
+
+    Remapping columns onto a merged var index permutes the column numbering, so
+    entries that were ascending in the shard's own numbering may not be
+    ascending in the merged numbering.  Sorting by ``(row, column)`` puts them
+    back in canonical order without moving entries across row boundaries.
+
+    Parameters
+    ----------
+    indices, data:
+        Flat CSR arrays for one shard, already remapped.
+    row_nnz:
+        Number of stored entries per row (``np.diff`` of the local indptr).
+    """
+    if len(indices) == 0:
+        return indices, data
+    row_ids = np.repeat(np.arange(len(row_nnz), dtype=np.int64), row_nnz)
+    order = np.lexsort((indices, row_ids))
+    return indices[order], data[order]
+
+
 def _compute_merged_var(
-    var_frames: list[pd.DataFrame], join: str
+    var_frames: list[pd.DataFrame], join: str, shard_names: list[str] | None = None
 ) -> tuple[pd.DataFrame, list[np.ndarray], bool]:
     """Compute the merged var DataFrame and per-shard column remaps.
 
@@ -33,6 +62,8 @@ def _compute_merged_var(
         var DataFrames, one per shard, in shard order.
     join:
         ``"inner"`` or ``"outer"``.
+    shard_names:
+        Optional shard paths, used only to make error messages actionable.
 
     Returns
     -------
@@ -45,6 +76,12 @@ def _compute_merged_var(
     is_identity : bool
         ``True`` when all shards share the identical var (fast path — no
         remapping required).
+
+    Raises
+    ------
+    ValueError
+        If a shard needing a remap has duplicate ``var_names``, or if the join
+        produces an empty var.
     """
     from functools import reduce
 
@@ -54,6 +91,27 @@ def _compute_merged_var(
     if all(idx.equals(indices[0]) for idx in indices[1:]):
         identity = np.arange(len(indices[0]), dtype=np.int32)
         return var_frames[0], [identity] * len(var_frames), True
+
+    # Past this point every shard's columns are remapped onto the merged index,
+    # which needs an unambiguous old-column -> new-column mapping.  Duplicate
+    # gene names make that mapping ill-defined and yield a repeated column
+    # selection, which h5py rejects outright.  Fail early, naming the shard.
+    # (The identity fast path above is a plain concatenation that needs no
+    # mapping, so duplicates stay legal there and merges that work today keep
+    # working.)
+    for i, idx in enumerate(indices):
+        if idx.has_duplicates:
+            dups = idx[idx.duplicated()].unique().tolist()
+            shown = ", ".join(repr(d) for d in dups[:5])
+            more = f", … (+{len(dups) - 5} more)" if len(dups) > 5 else ""
+            where = f"'{shard_names[i]}'" if shard_names is not None else f"at position {i}"
+            raise ValueError(
+                f"Shard {where} has duplicate var_names: {shown}{more}. "
+                f"Merging shards whose gene sets differ requires unique gene names "
+                f"in every shard, because each shard's columns must be remapped onto "
+                f"the merged var index. Call `adata.var_names_make_unique()` on the "
+                f"offending shard(s) and re-run."
+            )
 
     if join == "inner":
         merged_index = reduce(lambda a, b: a.intersection(b), indices)
@@ -109,9 +167,19 @@ def _write_remapped_sparse(
 
     new_indices = remap[old_indices]
 
+    # The merged var index is sorted while each shard's var is in its own
+    # arbitrary order, so `remap` is usually non-monotonic.  That permutes the
+    # column numbering and breaks the CSR sorted-indices invariant, which
+    # anndata and scipy consumers assume.  Re-sort each row when it can happen.
+    remap_is_increasing = _is_increasing(remap[remap >= 0])
+
     if join == "outer":
         # All entries are kept; only column positions change.
         shard_nnz = len(old_data)
+        if not remap_is_increasing:
+            new_indices, old_data = _sort_indices_within_rows(
+                new_indices, old_data, np.diff(old_indptr)
+            )
         out_store[path]["data"][current_nnz : current_nnz + shard_nnz] = old_data  # type: ignore[index]
         out_store[path]["indices"][current_nnz : current_nnz + shard_nnz] = new_indices  # type: ignore[index]
         shifted_indptr = old_indptr + current_nnz
@@ -133,6 +201,11 @@ def _write_remapped_sparse(
 
     new_local_indptr = np.concatenate([[0], np.cumsum(new_row_nnz)])
     shard_surviving = int(mask.sum())
+
+    if not remap_is_increasing:
+        surviving_indices, surviving_data = _sort_indices_within_rows(
+            surviving_indices, surviving_data, new_row_nnz
+        )
 
     out_store[path]["data"][current_nnz : current_nnz + shard_surviving] = surviving_data  # type: ignore[index]
     out_store[path]["indices"][current_nnz : current_nnz + shard_surviving] = surviving_indices  # type: ignore[index]
@@ -268,7 +341,7 @@ def merge_out_of_core(
         if hasattr(store_first, "close"):
             store_first.close()
 
-    merged_var, col_remaps, is_identity = _compute_merged_var(var_frames, join)
+    merged_var, col_remaps, is_identity = _compute_merged_var(var_frames, join, input_files)
     num_genes: int = len(merged_var)
 
     # Only merge layers present in *every* shard; absent layers would produce
@@ -438,15 +511,27 @@ def merge_out_of_core(
                 shard_X = in_store["X"][:]
                 if is_identity:
                     out_store["X"][current_cell : current_cell + num_cells_in_shard, :] = shard_X
-                elif join == "inner":
-                    valid = remap >= 0
-                    out_store["X"][  # type: ignore[index]
-                        current_cell : current_cell + num_cells_in_shard, remap[valid]
-                    ] = shard_X[:, valid]
                 else:
+                    if join == "inner":
+                        valid = remap >= 0
+                        selection = remap[valid]
+                        block = shard_X[:, valid]
+                    else:
+                        selection = remap
+                        block = shard_X
+
+                    # h5py requires a strictly increasing fancy-index selection.
+                    # `selection` follows the shard's own gene order, which is
+                    # rarely sorted, so order the columns and permute the data
+                    # block to match before writing.
+                    if not _is_increasing(selection):
+                        order = np.argsort(selection, kind="stable")
+                        selection = selection[order]
+                        block = block[:, order]
+
                     out_store["X"][  # type: ignore[index]
-                        current_cell : current_cell + num_cells_in_shard, remap
-                    ] = shard_X
+                        current_cell : current_cell + num_cells_in_shard, selection
+                    ] = block
 
             # Stream layers
             for layer in layer_nnz:
