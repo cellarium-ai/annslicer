@@ -58,7 +58,7 @@ def _write_shard_from_indices(
     sorted_idx = np.sort(indices)
 
     X = _unwrap(adata.X[sorted_idx, :])
-    layers = {k: _unwrap(adata.layers[k][sorted_idx, :]) for k in adata.layers}
+    layers = {k: _unwrap(adata.layers[k][sorted_idx, :]) for k in adata.layers if k is not None}
     obsm = {k: np.asarray(adata.obsm[k][sorted_idx]) for k in adata.obsm}
     obs = adata.obs.iloc[sorted_idx]
 

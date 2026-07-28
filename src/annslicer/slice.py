@@ -174,7 +174,7 @@ def _shard_store(
             sorted_idx = np.sort(orig_idx)
             restore = np.argsort(np.argsort(orig_idx))
             X = _unwrap(adata.X[sorted_idx, :])[restore]
-            layers = {k: _unwrap(adata.layers[k][sorted_idx, :])[restore] for k in adata.layers}
+            layers = {k: _unwrap(adata.layers[k][sorted_idx, :])[restore] for k in adata.layers if k is not None}
             obsm = {k: np.asarray(adata.obsm[k][sorted_idx])[restore] for k in adata.obsm}
             obs = adata.obs.iloc[orig_idx]
             ad.AnnData(
