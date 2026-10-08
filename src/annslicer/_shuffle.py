@@ -30,7 +30,7 @@ from typing import Any
 
 import numpy as np
 import scipy.sparse as sp
-from joblib import Parallel, delayed
+from joblib import delayed
 
 from annslicer._common import (
     LazyData,
@@ -40,6 +40,7 @@ from annslicer._common import (
     _take_rows,
     _write_h5ad_shard,
 )
+from annslicer._parallel import _Progress, run_parallel
 from annslicer._resources import _release_workers, _resolve_resources, _row_bytes
 
 logger = logging.getLogger(__name__)
@@ -257,9 +258,9 @@ def _write_bucket(
     var: Any,
     uns: dict[str, Any],
     compression: str | None,
-) -> None:
+) -> int:
     """
-    Assemble one bucket and write its shards.
+    Assemble one bucket and write its shards; return how many were written.
 
     ``bucket_bounds`` has one ``(lo, hi)`` row range per block file; ``base`` is the output
     position of the bucket's first cell; ``payloads`` holds ``(filename, obs, obsm)`` per shard.
@@ -281,6 +282,7 @@ def _write_bucket(
         X = mats["X"][rows] if "X" in mats else None
         layers = {k[len("layers/") :]: v[rows] for k, v in mats.items() if k != "X"}
         _write_h5ad_shard(X, layers, obs, var, obsm, uns, filename, compression)
+    return len(payloads)
 
 
 # ---------------------------------------------------------------------------
@@ -363,11 +365,15 @@ def shuffled_shards(
 
         logger.info("Pass 1/2: scattering input rows into buckets...")
         bounds = np.stack(
-            Parallel(n_jobs=plan.n_jobs, max_nbytes=None)(
-                delayed(_scatter_block)(
-                    input_file, keys, scratch, i, start, stop, bucket_rows, n_buckets
-                )
-                for i, start, stop in blocks
+            run_parallel(
+                (
+                    delayed(_scatter_block)(
+                        input_file, keys, scratch, i, start, stop, bucket_rows, n_buckets
+                    )
+                    for i, start, stop in blocks
+                ),
+                plan.n_jobs,
+                _Progress("Pass 1/2", len(blocks), "blocks"),
             )
         )
 
@@ -392,9 +398,12 @@ def shuffled_shards(
                 )
 
         logger.info("Pass 2/2: writing %d shards...", n_shards)
-        # max_nbytes=None: pass arrays by value; joblib would otherwise hand large ones to the
-        # workers as read-only np.memmap objects, which anndata cannot write.
-        Parallel(n_jobs=plan.n_jobs, max_nbytes=None)(bucket_tasks())
+        run_parallel(
+            bucket_tasks(),
+            plan.n_jobs,
+            _Progress("Pass 2/2", n_shards, "shards"),
+            weight=lambda shards_written: shards_written,
+        )
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
         if plan.n_jobs > 1:

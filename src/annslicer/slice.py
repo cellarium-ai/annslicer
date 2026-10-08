@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
+import time
 
 import numpy as np
 import pandas as pd
@@ -19,6 +21,7 @@ from annslicer._common import (
     _write_shard_from_indices,
 )
 from annslicer._contiguous import contiguous_shards
+from annslicer._parallel import _fmt_duration
 from annslicer._shuffle import shuffled_shards
 
 logger = logging.getLogger(__name__)
@@ -87,7 +90,11 @@ def shard_h5ad(
     _ensure_parent_dir(output_prefix)
 
     logger.info("Opening %s lazily...", input_file)
+    start = time.monotonic()
     data = _open_lazy(input_file)
+    logger.info(
+        "Read metadata for %d cells in %s.", data.n_obs, _fmt_duration(time.monotonic() - start)
+    )
     try:
         _shard_store(
             input_file,
@@ -139,6 +146,7 @@ def _shard_store(
     )
 
     logger.info("Total cells: %d. Generating shards of %d...", total_cells, shard_size)
+    start = time.monotonic()
 
     if shuffle:
         logger.info("Shuffle enabled (seed=%s).", seed)
@@ -158,7 +166,13 @@ def _shard_store(
             input_file, data, out_names, shard_size, compression, n_jobs, memory_limit
         )
 
-    logger.info("All shards successfully created.")
+    written = sum(os.path.getsize(name) for name in out_names)
+    logger.info(
+        "All %d shards successfully created in %s (%.1f GB written).",
+        n_shards,
+        _fmt_duration(time.monotonic() - start),
+        written / 1024**3,
+    )
 
 
 def shard_by_obs_column(

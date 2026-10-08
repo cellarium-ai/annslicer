@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed
+from joblib import delayed
 
 from annslicer._common import (
     LazyData,
@@ -24,6 +24,7 @@ from annslicer._common import (
     _take_rows,
     _write_h5ad_shard,
 )
+from annslicer._parallel import _Progress, run_parallel
 from annslicer._resources import _release_workers, _resolve_resources, _row_bytes
 
 logger = logging.getLogger(__name__)
@@ -106,9 +107,7 @@ def contiguous_shards(
             )
 
     try:
-        # max_nbytes=None: pass arrays by value; joblib would otherwise hand large ones to the
-        # workers as read-only np.memmap objects, which anndata cannot write.
-        Parallel(n_jobs=n_jobs, max_nbytes=None)(tasks())
+        run_parallel(tasks(), n_jobs, _Progress("Writing shards", n_shards, "shards"))
     finally:
         if n_jobs > 1:
             _release_workers()

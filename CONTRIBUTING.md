@@ -124,6 +124,8 @@ make benchmark INPUT=/data/my_file.h5ad \
     PYTEST_ARGS="--bench-workdir /mnt/scratch --bench-jobs 1,4,8,16,auto --bench-memory-limit 32GB --benchmark-json=results.json"
 ```
 
+To watch a long run, add `--log-cli-level=INFO` to `PYTEST_ARGS`: annslicer's own log lines then appear live, including a progress line (shards or blocks done, elapsed time, ETA) about every 30 seconds and the time each pass took.
+
 Memory is reported as `peak_memory_MiB` (tracemalloc, single-process synthetic runs) or `peak_tree_RSS_MiB` (the summed resident memory of the process and its workers, sampled during the run: an upper-bound estimate that includes each process's imported libraries). The dataset shape and output compression are recorded in each result's `extra_info`, so `--benchmark-json` files are self-describing.
 
 ## Releasing a new version and pushing to PyPI

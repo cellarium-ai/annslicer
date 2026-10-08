@@ -379,7 +379,7 @@ The 2.4M single-cell heart dataset at https://singlecell.broadinstitute.org/sing
 
 This benchmark can be reproduced by running
 ```console
-make benchmark INPUT=HeartMap_V1.0_raw_counts.h5ad
+make benchmark INPUT=HeartMap_V1.0_raw_counts.h5ad PYTEST_ARGS="--log-cli-level=INFO"
 ```
 on a google `n1-standard-16` VM with 60GB RAM and a 500GB SSD boot disk. Benchmarks here all write gzipped output files.
 
