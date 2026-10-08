@@ -19,7 +19,7 @@ import pandas as pd
 import pytest
 import scipy.sparse as sp
 
-from annslicer import _shuffle
+from annslicer import _resources, _shuffle
 from annslicer._common import _open_lazy
 from annslicer.slice import shard_h5ad
 
@@ -206,17 +206,17 @@ def test_plan_wide_buckets_for_many_small_shards():
     [("512", 512), ("1KB", 1024), ("2MiB", 2 * 1024**2), ("1.5G", int(1.5 * 1024**3)), (7, 7)],
 )
 def test_parse_size(text, expected):
-    assert _shuffle._parse_size(text) == expected
+    assert _resources._parse_size(text) == expected
 
 
 def test_parse_size_rejects_garbage():
     with pytest.raises(ValueError, match="memory size"):
-        _shuffle._parse_size("lots")
+        _resources._parse_size("lots")
 
 
 def test_default_resources_are_sane():
-    assert _shuffle._available_cpus() >= 1
-    assert _shuffle._default_memory_limit() > 0
+    assert _resources._available_cpus() >= 1
+    assert _resources._default_memory_limit() > 0
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ from annslicer._common import (
     _open_lazy,
     _write_shard_from_indices,
 )
+from annslicer._contiguous import contiguous_shards
 from annslicer._shuffle import shuffled_shards
 
 logger = logging.getLogger(__name__)
@@ -40,9 +41,10 @@ def shard_h5ad(
 
     X and every layer stay on disk: the input is opened lazily (see
     :func:`annslicer._common._open_lazy`) and only the rows of the shard being written are
-    ever read.  Without shuffling, each shard is one contiguous read.  With shuffling, a
-    two-pass scatter / gather (see :mod:`annslicer._shuffle`) keeps all reads sequential at
-    the cost of temporary scratch space.
+    ever read.  Without shuffling, each shard is one contiguous read and shards are written
+    in parallel (see :mod:`annslicer._contiguous`).  With shuffling, a two-pass scatter /
+    gather (see :mod:`annslicer._shuffle`) keeps all reads sequential at the cost of
+    temporary scratch space.
 
     Parameters
     ----------
@@ -70,17 +72,17 @@ def shard_h5ad(
         e.g. ``"gzip"`` or ``"lzf"``.  ``None`` (default) writes
         uncompressed files, which is fastest for downstream streaming reads.
     n_jobs:
-        Number of worker processes for shuffled sharding (ignored when ``shuffle=False``).
-        ``None`` (default) uses ``min(available CPUs, 8)``, fewer for small inputs, and
-        is further limited by ``memory_limit``.  When calling from a script with ``n_jobs > 1``,
-        no ``if __name__ == "__main__":`` guard is needed.
+        Number of worker processes.  ``None`` (default) uses ``min(available CPUs, 8)``, fewer
+        for small inputs, and is further limited by ``memory_limit``.  When calling from a
+        script with ``n_jobs > 1``, no ``if __name__ == "__main__":`` guard is needed.
     memory_limit:
-        Memory budget used to size the workers' blocks and to limit how many run at once,
-        as bytes or a string such as ``"16GB"``.  Defaults to half of the available RAM.  It is
-        a sizing target, not a hard cap.
+        Memory budget used to limit how many workers run at once (and, when shuffling, to size
+        their blocks), as bytes or a string such as ``"16GB"``.  Defaults to half of the
+        available RAM.  It is a sizing target, not a hard cap.
     tmpdir:
         Directory for the temporary scratch files of shuffled sharding (about the size of the
-        uncompressed matrices).  Defaults to the system temp directory.
+        uncompressed matrices; unused without ``shuffle``).  Defaults to the system temp
+        directory.
     """
     _ensure_parent_dir(output_prefix)
 
@@ -120,8 +122,8 @@ def _shard_store(
     """
     Core sharding loop operating on an already-opened :class:`LazyData`.
 
-    Unshuffled shards are contiguous row ranges, read with one slice per matrix.  Shuffled
-    shards come from :func:`annslicer._shuffle.shuffled_shards`.
+    Unshuffled shards come from :func:`annslicer._contiguous.contiguous_shards`, shuffled
+    shards from :func:`annslicer._shuffle.shuffled_shards`.
     """
     total_cells = data.n_obs
     n_shards = (total_cells + shard_size - 1) // shard_size
@@ -152,13 +154,9 @@ def _shard_store(
             tmpdir,
         )
     else:
-        for shard_num, out_filename in enumerate(out_names):
-            start_idx = shard_num * shard_size
-            end_idx = min(start_idx + shard_size, total_cells)
-            logger.info("  Writing %s (cells %d–%d)...", out_filename, start_idx, end_idx)
-            _write_shard_from_indices(
-                data, np.arange(start_idx, end_idx, dtype=np.intp), out_filename, compression
-            )
+        contiguous_shards(
+            input_file, data, out_names, shard_size, compression, n_jobs, memory_limit
+        )
 
     logger.info("All shards successfully created.")
 
@@ -354,8 +352,8 @@ def register_subcommand(subparsers: argparse._SubParsersAction[argparse.Argument
         default=None,
         metavar="N",
         help=(
-            "Worker processes for --shuffle (default: min(available CPUs, 8), fewer for "
-            "small inputs; further limited by --memory-limit)."
+            "Worker processes (default: min(available CPUs, 8), fewer for small inputs; "
+            "further limited by --memory-limit)."
         ),
     )
     p.add_argument(
@@ -363,7 +361,7 @@ def register_subcommand(subparsers: argparse._SubParsersAction[argparse.Argument
         default=None,
         metavar="SIZE",
         help=(
-            "Memory budget for --shuffle workers, e.g. 16GB (default: half of available RAM). "
+            "Memory budget for the workers, e.g. 16GB (default: half of available RAM). "
             "A sizing target, not a hard cap."
         ),
     )

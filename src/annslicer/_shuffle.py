@@ -23,7 +23,6 @@ from __future__ import annotations
 import logging
 import math
 import os
-import re
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -41,58 +40,14 @@ from annslicer._common import (
     _take_rows,
     _write_h5ad_shard,
 )
+from annslicer._resources import _release_workers, _resolve_resources, _row_bytes
 
 logger = logging.getLogger(__name__)
 
-_MAX_AUTO_JOBS = 8
 _MAX_BLOCK_ROWS = 50_000
 _MIN_SEGMENT_ROWS = 64  # target minimum rows a block contributes to each bucket
 _BLOCK_MEM_FACTOR = 3  # block + its reordered copy + write buffers
 _BUCKET_MEM_FACTOR = 4  # gathered pieces + reordered copy + AnnData assembly + write
-_MEMORY_FRACTION = 0.5  # default memory limit, as a fraction of total (or cgroup-limited) RAM
-_FALLBACK_MEMORY = 4 * 1024**3
-_MIN_BYTES_PER_JOB = 256 * 1024**2  # don't pay worker start-up costs for smaller jobs
-_ROW_OVERHEAD = 16  # per-row bytes in the spill: destination position + indptr entry
-_SIZE_UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
-
-
-# ---------------------------------------------------------------------------
-# Resource defaults
-# ---------------------------------------------------------------------------
-
-
-def _available_cpus() -> int:
-    """CPUs this process may use (respects affinity masks, unlike ``os.cpu_count``)."""
-    affinity = getattr(os, "sched_getaffinity", None)  # Linux only
-    return len(affinity(0)) if affinity is not None else (os.cpu_count() or 1)
-
-
-def _default_memory_limit() -> int:
-    """Half of physical RAM, or of the cgroup memory limit if one applies."""
-    try:
-        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (AttributeError, OSError, ValueError):
-        return _FALLBACK_MEMORY
-    for cgroup_file in (
-        "/sys/fs/cgroup/memory.max",  # cgroup v2
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
-    ):
-        try:
-            with open(cgroup_file) as fh:
-                total = min(total, int(fh.read().strip()))
-        except (OSError, ValueError):  # missing, or "max" (unlimited)
-            continue
-    return int(total * _MEMORY_FRACTION)
-
-
-def _parse_size(value: int | float | str) -> int:
-    """Parse a byte count such as ``8_000_000_000``, ``"8GB"``, ``"512MiB"`` or ``"1.5G"``."""
-    if isinstance(value, (int, float)):
-        return int(value)
-    match = re.fullmatch(r"\s*([\d.]+)\s*([KMGT]?)I?B?\s*", value, re.IGNORECASE)
-    if match is None:
-        raise ValueError(f"Cannot parse memory size {value!r}; use e.g. '8GB' or '512MB'.")
-    return int(float(match.group(1)) * _SIZE_UNITS[match.group(2).upper()])
 
 
 # ---------------------------------------------------------------------------
@@ -151,18 +106,13 @@ def _plan(
 
 def _describe(key: str, mat: Any) -> tuple[bool, int, float]:
     """Return ``(is_sparse, n_cols, approx spill bytes per row)`` for a lazy matrix."""
-    n_rows, n_cols = mat.shape
-    if not hasattr(mat, "group"):  # dense h5py / zarr array
-        return False, n_cols, n_cols * mat.dtype.itemsize + _ROW_OVERHEAD
-    group = mat.group
-    if group.attrs.get("encoding-type") != "csr_matrix":
+    is_sparse = hasattr(mat, "group")  # otherwise a dense h5py / zarr array
+    if is_sparse and mat.group.attrs.get("encoding-type") != "csr_matrix":
         raise ValueError(
-            f"{key!r} is stored as {group.attrs.get('encoding-type')!r}; shuffled sharding "
+            f"{key!r} is stored as {mat.group.attrs.get('encoding-type')!r}; shuffled sharding "
             f"needs row-compressed (CSR) or dense storage. Convert it to CSR first."
         )
-    item_bytes = group["data"].dtype.itemsize + group["indices"].dtype.itemsize
-    nnz = int(group["indptr"][-1])
-    return True, n_cols, nnz / max(n_rows, 1) * item_bytes + _ROW_OVERHEAD
+    return is_sparse, mat.shape[1], _row_bytes(mat)
 
 
 # ---------------------------------------------------------------------------
@@ -338,16 +288,6 @@ def _write_bucket(
 # ---------------------------------------------------------------------------
 
 
-def _release_workers() -> None:
-    """Shut down joblib's idle worker processes so they don't hold on to memory."""
-    try:
-        from joblib.externals.loky import get_reusable_executor
-
-        get_reusable_executor().shutdown(wait=True)
-    except Exception:  # best-effort cleanup only
-        logger.debug("Could not shut down joblib workers.", exc_info=True)
-
-
 def shuffled_shards(
     input_file: str,
     data: LazyData,
@@ -381,13 +321,7 @@ def shuffled_shards(
         spill_bytes += row_bytes * n_obs
     row_bytes = spill_bytes / max(n_obs, 1)
 
-    if n_jobs is None:
-        n_jobs = min(
-            _available_cpus(), _MAX_AUTO_JOBS, max(1, int(spill_bytes // _MIN_BYTES_PER_JOB))
-        )
-    elif n_jobs < 1:
-        raise ValueError(f"n_jobs must be at least 1, got {n_jobs}.")
-    limit = _default_memory_limit() if memory_limit is None else _parse_size(memory_limit)
+    n_jobs, limit = _resolve_resources(n_jobs, memory_limit, spill_bytes)
     plan = _plan(n_obs, shard_size, row_bytes, n_jobs, limit, block_rows, shards_per_bucket)
 
     bucket_rows = plan.shards_per_bucket * shard_size

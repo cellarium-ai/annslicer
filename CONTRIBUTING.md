@@ -87,7 +87,7 @@ The benchmark suite (`benchmarks/bench_slice.py`) compares:
 
 | Benchmark | What it measures |
 |---|---|
-| `bench_annslicer_slice` | Full out-of-core sharding pipeline (no shuffle) |
+| `bench_annslicer_slice[jobsN]` | Full out-of-core sharding pipeline (no shuffle) with `N` worker processes (same job counts as below) |
 | `bench_annslicer_slice_shuffle[jobsN]` | Shuffled sharding (two-pass scatter / gather) with `N` worker processes (default runs: 1 and 4); `[jobsauto]` uses annslicer's default worker count, i.e. real-world default usage, and is the second run when you pass `INPUT=` (the resolved count is recorded as `workers`) |
 | `bench_anndata_backed_iterate` | Baseline: backed AnnData row iteration |
 | `bench_anndata_backed_shuffle` | Baseline: backed AnnData fancy-indexed shuffle |
@@ -104,7 +104,7 @@ Pass an `.h5ad` file with the `INPUT` make variable (a positional `make benchmar
 make benchmark INPUT=/data/my_file.h5ad
 ```
 
-or, equivalently, `pytest benchmarks/ --benchmark-only -v -s --bench-input /data/my_file.h5ad`. With your own input every benchmark runs once (time and peak memory from the same run), the zarr benchmarks are skipped, and the baselines run too, including the anndata backed shuffle, which can take very long on large files. Select what to run with `-k`, for example `PYTEST_ARGS="-k annslicer"` to skip the baselines.
+or, equivalently, `pytest benchmarks/ --benchmark-only -v -s --bench-input /data/my_file.h5ad`. With your own input only the shuffled `.h5ad` benchmarks run (gzip output, as always): `bench_annslicer_slice_shuffle` at 1 job and at the default worker count, plus the anndata backed shuffle baseline. The unshuffled and zarr benchmarks are left out. Each runs once (time and peak memory from the same run), and the backed shuffle can take very long on large files. Select what to run with `-k`, for example `PYTEST_ARGS="-k annslicer"` to skip the baseline.
 
 Extra options, passed through `PYTEST_ARGS` or directly to pytest (`pytest benchmarks/ --help` lists them under "annslicer benchmarks"):
 
@@ -112,7 +112,7 @@ Extra options, passed through `PYTEST_ARGS` or directly to pytest (`pytest bench
 |---|---|
 | `--bench-input FILE.h5ad` | Benchmark this file instead of the synthetic dataset (what `INPUT=` sets) |
 | `--bench-workdir DIR` | Directory for the shard outputs and the shuffle scratch files; use a large local disk |
-| `--bench-jobs 1,2,4,8,auto` | Worker counts to benchmark for the shuffle (default `1,4`, or `1,auto` with `--bench-input`; `auto` is annslicer's default worker count; `1` is always included) |
+| `--bench-jobs 1,2,4,8,auto` | Worker counts to benchmark for annslicer (default `1,4`, or `1,auto` with `--bench-input`; `auto` is annslicer's default worker count; `1` is always included) |
 | `--bench-memory-limit 16GB` | Pass this `memory_limit` to annslicer and report it next to the measured peak memory |
 | `--bench-shard-size N` | Cells per shard (default 5000 for synthetic data, 10000 for `--bench-input`) |
 | `--bench-drop-caches` | Drop the Linux page cache before each benchmark (needs root), so earlier benchmarks don't warm the cache for later ones |

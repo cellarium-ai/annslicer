@@ -29,7 +29,7 @@ N_GENES_BENCH = 30_000
 NNZ_PER_CELL = 1_500
 
 DEFAULT_SHARD_SIZE = 5_000
-# Worker counts benchmarked for the shuffle.  The synthetic suite uses an explicit 4 workers;
+# Worker counts benchmarked for annslicer.  The synthetic suite uses an explicit 4 workers;
 # with --bench-input the second run is annslicer's default worker count ("auto", n_jobs=None),
 # so a run on your own data reflects real-world default usage.
 DEFAULT_JOBS = "1,4"
@@ -47,8 +47,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--bench-input",
         default=None,
         metavar="FILE.h5ad",
-        help="Benchmark this .h5ad file instead of generating a synthetic dataset. Each "
-        "benchmark then runs once, and the zarr benchmarks are skipped.",
+        help="Benchmark this .h5ad file instead of generating a synthetic dataset. Only the "
+        "shuffled h5ad benchmarks run (gzip output), each once.",
     )
     group.addoption(
         "--bench-workdir",
@@ -61,7 +61,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--bench-jobs",
         default=None,
         metavar="N,N,...",
-        help="Worker counts to benchmark for annslicer's shuffled sharding, e.g. 1,2,4,8,auto. "
+        help="Worker counts to benchmark for annslicer, e.g. 1,2,4,8,auto. "
         "'auto' is annslicer's default worker count (n_jobs=None). 1 is always included, since "
         "it is the run whose memory is comparable with the single-process baselines. "
         f"Default: {DEFAULT_JOBS} for the synthetic dataset, {DEFAULT_JOBS_CUSTOM_INPUT} for "
@@ -128,11 +128,20 @@ def _jobs_option(config: pytest.Config) -> list[int | None]:
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
-    """Run the shuffle benchmarks once per requested worker count (``auto`` = default)."""
+    """Run the annslicer benchmarks once per requested worker count (``auto`` = default)."""
     if "n_jobs" in metafunc.fixturenames:
         jobs = _jobs_option(metafunc.config)
         ids = ["jobsauto" if j is None else f"jobs{j}" for j in jobs]
         metafunc.parametrize("n_jobs", jobs, ids=ids)
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """With ``--bench-input`` run only the shuffled .h5ad benchmarks (no unshuffled, no zarr)."""
+    if not config.getoption("--bench-input"):
+        return
+    keep = [i for i in items if "shuffle" in i.originalname and "zarr" not in i.originalname]
+    config.hook.pytest_deselected(items=[i for i in items if i not in keep])
+    items[:] = keep
 
 
 @pytest.fixture(scope="session")
@@ -231,18 +240,14 @@ def large_h5ad(bench_config: BenchConfig, tmp_path_factory: pytest.TempPathFacto
 
 
 @pytest.fixture(scope="session")
-def large_zarr(
-    bench_config: BenchConfig, large_h5ad: str, tmp_path_factory: pytest.TempPathFactory
-) -> str:
+def large_zarr(large_h5ad: str, tmp_path_factory: pytest.TempPathFactory) -> str:
     """
     Write the synthetic benchmark dataset as a .zarr store and return its path.
 
     Re-uses the already-generated large_h5ad data so the two fixtures are
     guaranteed to have identical contents, keeping h5ad vs zarr comparisons
-    apples-to-apples.  Skipped if zarr is not installed or --bench-input is used.
+    apples-to-apples.  Skipped if zarr is not installed.
     """
-    if bench_config.custom_input:
-        pytest.skip("zarr benchmarks are skipped when --bench-input is given")
     pytest.importorskip("zarr", reason="zarr not installed; skipping zarr benchmarks")
     adata = ad.read_h5ad(large_h5ad)
     out_dir = tmp_path_factory.mktemp("bench_zarr_data")

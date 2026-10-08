@@ -14,7 +14,7 @@ Pairs:
   bench_annslicer_zarr_slice           vs  bench_anndata_zarr_iterate
   bench_annslicer_zarr_slice_shuffle   vs  bench_anndata_zarr_shuffle
 
-The annslicer shuffle benchmarks run once per ``--bench-jobs`` entry (default ``1,4``, or
+The annslicer benchmarks (shuffled or not) run once per ``--bench-jobs`` entry (default ``1,4``, or
 ``1,auto`` with ``--bench-input``).  The 1-job run is single-process, so its memory is
 comparable with the baselines.  "auto" is annslicer's default worker count
 (``n_jobs=None``), i.e. real-world default usage; the number of workers a run resolved to
@@ -149,7 +149,7 @@ def _run_benchmark(
 
 
 class _WorkerCount(logging.Handler):
-    """Captures how many workers annslicer's shuffle resolved ``n_jobs`` to, from its log."""
+    """Captures how many workers annslicer resolved ``n_jobs`` to, from its log."""
 
     def __init__(self) -> None:
         super().__init__(logging.INFO)
@@ -171,9 +171,9 @@ def _annslicer(
     """
     Run annslicer with the benchmark settings.  ``n_jobs=None`` is annslicer's default.
 
-    If *record* (a dict) is given, the resolved number of shuffle workers is stored in it.
+    If *record* (a dict) is given, the resolved number of workers is stored in it.
     """
-    logger = logging.getLogger("annslicer._shuffle")
+    logger = logging.getLogger("annslicer")
     handler, level = _WorkerCount(), logger.level
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
@@ -292,22 +292,38 @@ def _anndata_zarr_shard_shuffle(
 
 
 def bench_annslicer_slice(
-    benchmark, large_h5ad, bench_output_dir, bench_scratch_dir, bench_config, dataset_info
+    benchmark, large_h5ad, bench_output_dir, bench_scratch_dir, bench_config, dataset_info, n_jobs
 ):
     """
-    annslicer — sequential sharding.
+    annslicer — sequential sharding with ``n_jobs`` worker processes (None = the default).
 
     Reads each shard as one contiguous slice with no full matrix ever loaded into RAM.
     Writes one .h5ad file per shard to the shared bench output directory
-    (files are overwritten on every round, keeping disk usage bounded).
+    (files are overwritten on every round, keeping disk usage bounded).  The jobs1 run is
+    single-process, so its memory is comparable with the single-process baseline.
     """
     prefix = str(bench_output_dir / "shard")
     benchmark.group = "h5ad-sequential"
 
     def _fn():
-        _annslicer(large_h5ad, prefix, bench_config, bench_scratch_dir)
+        _annslicer(
+            large_h5ad,
+            prefix,
+            bench_config,
+            bench_scratch_dir,
+            n_jobs=n_jobs,
+            record=benchmark.extra_info,
+        )
 
-    _run_benchmark(benchmark, _fn, "annslicer/slice", bench_config, dataset_info)
+    _run_benchmark(
+        benchmark,
+        _fn,
+        f"annslicer/slice jobs={_jobs_label(n_jobs)}",
+        bench_config,
+        dataset_info,
+        multiprocess=n_jobs != 1,
+        memory_limit=bench_config.memory_limit,
+    )
 
 
 def bench_anndata_backed_iterate(
@@ -393,16 +409,31 @@ def bench_anndata_backed_shuffle(
 
 
 def bench_annslicer_zarr_slice(
-    benchmark, large_zarr, bench_output_dir, bench_scratch_dir, bench_config, dataset_info
+    benchmark, large_zarr, bench_output_dir, bench_scratch_dir, bench_config, dataset_info, n_jobs
 ):
-    """annslicer — sequential sharding from a zarr store."""
+    """annslicer — sequential sharding from a zarr store with ``n_jobs`` workers (None = default)."""
     prefix = str(bench_output_dir / "shard")
     benchmark.group = "zarr-sequential"
 
     def _fn():
-        _annslicer(large_zarr, prefix, bench_config, bench_scratch_dir)
+        _annslicer(
+            large_zarr,
+            prefix,
+            bench_config,
+            bench_scratch_dir,
+            n_jobs=n_jobs,
+            record=benchmark.extra_info,
+        )
 
-    _run_benchmark(benchmark, _fn, "annslicer/zarr", bench_config, dataset_info)
+    _run_benchmark(
+        benchmark,
+        _fn,
+        f"annslicer/zarr jobs={_jobs_label(n_jobs)}",
+        bench_config,
+        dataset_info,
+        multiprocess=n_jobs != 1,
+        memory_limit=bench_config.memory_limit,
+    )
 
 
 def bench_anndata_zarr_iterate(
