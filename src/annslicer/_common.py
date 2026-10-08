@@ -1,25 +1,118 @@
 """
-Shared helpers for annslicer: out-of-core shard writing and CSV obs merging.
+Shared helpers for annslicer: lazy store opening, shard writing, and CSV obs merging.
 
-Used by both ``slice.py`` and ``filter.py`` to avoid code duplication.
+Used by ``slice.py``, ``filter.py`` and ``_shuffle.py`` to avoid code duplication.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass, field
 from typing import Any
 
 import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
+
+from annslicer._store import open_store
+
+try:
+    from anndata.io import read_elem, sparse_dataset
+except ImportError:  # anndata < 0.11
+    from anndata.experimental import read_elem, sparse_dataset
 
 logger = logging.getLogger(__name__)
 
+_SPARSE_ENCODINGS = ("csr_matrix", "csc_matrix")
 
-def _unwrap(arr: np.ndarray) -> Any:
-    """Unwrap the 0-d object array that h5py sometimes returns for backed sparse layers."""
-    return arr.item() if isinstance(arr, np.ndarray) and arr.ndim == 0 else arr
+
+@dataclass
+class LazyData:
+    """
+    The contents of an .h5ad / .zarr store, with the big matrices left on disk.
+
+    ``X`` and ``layers`` hold lazy handles (``sparse_dataset`` objects for sparse matrices,
+    raw h5py / zarr arrays for dense ones) that support row slicing and fancy indexing
+    without loading the matrix.  Everything else is small and read eagerly.
+    """
+
+    root: Any
+    X: Any = None
+    layers: dict[str, Any] = field(default_factory=dict)
+    obs: pd.DataFrame = field(default_factory=pd.DataFrame)
+    var: pd.DataFrame = field(default_factory=pd.DataFrame)
+    obsm: dict[str, Any] = field(default_factory=dict)
+    uns: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def n_obs(self) -> int:
+        return len(self.obs)
+
+    def matrices(self) -> dict[str, Any]:
+        """Lazy matrices keyed by their store path: ``"X"``, ``"layers/<name>"``."""
+        mats = {} if self.X is None else {"X": self.X}
+        mats.update({f"layers/{k}": v for k, v in self.layers.items()})
+        return mats
+
+    def close(self) -> None:
+        if isinstance(self.root, h5py.File):
+            self.root.close()
+
+
+def _open_root(path: str) -> Any:
+    """Open an .h5ad (h5py.File) or .zarr (zarr group) store read-only."""
+    return open_store(path, "r") if path.endswith(".zarr") else h5py.File(path, "r")
+
+
+def _lazy_matrix(root: Any, key: str) -> Any:
+    """Return a lazy handle for the matrix at *key* (``sparse_dataset`` if sparse, else the array)."""
+    item = root[key]
+    if item.attrs.get("encoding-type") in _SPARSE_ENCODINGS:
+        return sparse_dataset(item)
+    return item
+
+
+def _open_lazy(path: str) -> LazyData:
+    """
+    Open *path* without loading any matrix data into RAM.
+
+    Unlike ``anndata.read_h5ad(backed="r")``, this never materialises layers (some anndata
+    versions load them eagerly) and behaves identically for .h5ad and .zarr inputs.
+    """
+    root = _open_root(path)
+    data = LazyData(root=root)
+    if "X" in root:
+        data.X = _lazy_matrix(root, "X")
+    if "layers" in root:
+        data.layers = {k: _lazy_matrix(root["layers"], k) for k in root["layers"]}
+    data.obs = read_elem(root["obs"])
+    data.var = read_elem(root["var"])
+    data.obsm = read_elem(root["obsm"]) if "obsm" in root else {}
+    data.uns = read_elem(root["uns"]) if "uns" in root else {}
+    return data
+
+
+def _read_rows(mat: Any, idx: np.ndarray | slice) -> Any:
+    """
+    Read rows of a lazy matrix.  *idx* is a slice or an increasing array of row indices.
+    A contiguous run of indices is turned into a slice, which is far cheaper to read than
+    fancy indexing (a few large reads instead of several small reads per row).
+    """
+    if isinstance(idx, np.ndarray) and idx.size and idx[-1] - idx[0] + 1 == idx.size:
+        idx = slice(int(idx[0]), int(idx[-1]) + 1)
+    return mat[idx, :]
+
+
+def _take_rows(a: Any, idx: np.ndarray) -> Any:
+    """Select rows *idx* (in that order) from an in-memory array / DataFrame / sparse matrix."""
+    if isinstance(a, pd.DataFrame):
+        return a.iloc[idx]
+    if sp.issparse(a):
+        return a[idx]
+    return np.asarray(a)[idx]
 
 
 def _ensure_parent_dir(output_prefix: str) -> None:
@@ -29,39 +122,17 @@ def _ensure_parent_dir(output_prefix: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
-def _write_shard_from_indices(
-    adata: ad.AnnData,
-    indices: np.ndarray,
+def _write_h5ad_shard(
+    X: Any,
+    layers: dict[str, Any],
+    obs: pd.DataFrame,
+    var: pd.DataFrame,
+    obsm: dict[str, Any],
+    uns: dict[str, Any],
     out_filename: str,
     compression: str | None = None,
 ) -> None:
-    """
-    Write a subset of an AnnData object (identified by integer row indices) to a
-    new .h5ad file.
-
-    Indices are sorted before reading so that disk access is sequential (efficient
-    for both HDF5 and zarr backends).  The output preserves the source order — cells
-    appear in the same relative order as they do in the input file.
-
-    Parameters
-    ----------
-    adata:
-        An already-opened (backed or in-memory) AnnData object.
-    indices:
-        Integer row indices to include.  Need not be sorted; they will be sorted
-        internally before reading and the output will be in ascending index order.
-    out_filename:
-        Destination .h5ad path.
-    compression:
-        HDF5 compression filter (e.g. ``"gzip"``).  ``None`` writes uncompressed.
-    """
-    sorted_idx = np.sort(indices)
-
-    X = _unwrap(adata.X[sorted_idx, :])
-    layers = {k: _unwrap(adata.layers[k][sorted_idx, :]) for k in adata.layers if k is not None}
-    obsm = {k: np.asarray(adata.obsm[k][sorted_idx]) for k in adata.obsm}
-    obs = adata.obs.iloc[sorted_idx]
-
+    """Assemble an in-memory AnnData from already-read pieces and write it to *out_filename*."""
     # address dragen h5ad error issue #10
     if "_index" in obs.columns:
         obs = obs.drop(columns=["_index"])
@@ -72,11 +143,47 @@ def _write_shard_from_indices(
     ad.AnnData(
         X=X,
         obs=obs.copy(),
-        var=adata.var.copy(),
+        var=var.copy(),
         obsm=obsm,
         layers=layers,
-        uns=adata.uns.copy(),
+        uns=uns.copy(),
     ).write_h5ad(out_filename, compression=compression)
+
+
+def _write_shard_from_indices(
+    data: LazyData,
+    indices: np.ndarray,
+    out_filename: str,
+    compression: str | None = None,
+) -> None:
+    """
+    Write a subset of a :class:`LazyData` (identified by integer row indices) to a new
+    .h5ad file.
+
+    Indices are sorted before reading so that disk access is sequential (efficient
+    for both HDF5 and zarr backends).  The output preserves the source order — cells
+    appear in the same relative order as they do in the input file.
+
+    Parameters
+    ----------
+    data:
+        An opened store (see :func:`_open_lazy`).
+    indices:
+        Integer row indices to include.  Need not be sorted; they will be sorted
+        internally before reading and the output will be in ascending index order.
+    out_filename:
+        Destination .h5ad path.
+    compression:
+        HDF5 compression filter (e.g. ``"gzip"``).  ``None`` writes uncompressed.
+    """
+    sorted_idx = np.sort(indices)
+
+    X = None if data.X is None else _read_rows(data.X, sorted_idx)
+    layers = {k: _read_rows(v, sorted_idx) for k, v in data.layers.items()}
+    obsm = {k: _take_rows(v, sorted_idx) for k, v in data.obsm.items()}
+    _write_h5ad_shard(
+        X, layers, data.obs.iloc[sorted_idx], data.var, obsm, data.uns, out_filename, compression
+    )
 
 
 def _merge_csv_into_obs(

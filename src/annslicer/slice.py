@@ -7,57 +7,20 @@ from __future__ import annotations
 import argparse
 import logging
 import re
-from typing import Any
 
-import anndata as ad
 import numpy as np
 import pandas as pd
 
 from annslicer._common import (
+    LazyData,
     _ensure_parent_dir,
     _merge_csv_into_obs,
-    _unwrap,
+    _open_lazy,
     _write_shard_from_indices,
 )
-from annslicer._store import _require_zarr
+from annslicer._shuffle import shuffled_shards
 
 logger = logging.getLogger(__name__)
-
-
-def _open_zarr_backed(input_file: str) -> ad.AnnData:
-    """
-    Open a zarr store in a backed-like mode without loading matrix data into RAM.
-
-    X and sparse layers are wrapped as ``CSRDataset`` objects that support
-    out-of-core slice and fancy indexing.  Small metadata (obs, var, obsm,
-    uns, etc.) is loaded eagerly since it must fit in memory anyway.
-    """
-    from anndata.io import read_elem, sparse_dataset
-
-    zarr_mod = _require_zarr()
-    group = zarr_mod.open(input_file, mode="r")
-
-    def _lazy_or_dense(grp, key: str) -> Any:
-        """Return a CSRDataset if the key holds a sparse group, else read_elem."""
-        try:
-            return sparse_dataset(grp[key])
-        except Exception:
-            return read_elem(grp[key])
-
-    layers: dict[str, Any] = (
-        {k: _lazy_or_dense(group["layers"], k) for k in group["layers"]}
-        if "layers" in group
-        else {}
-    )
-
-    return ad.AnnData(
-        X=_lazy_or_dense(group, "X"),
-        **{
-            k: read_elem(group[k]) if k in group else {}
-            for k in ["obs", "var", "obsm", "varm", "uns", "obsp", "varp"]
-        },
-        layers=layers,
-    )
 
 
 def shard_h5ad(
@@ -68,17 +31,18 @@ def shard_h5ad(
     shuffle: bool = False,
     seed: int | None = None,
     compression: str | None = None,
+    n_jobs: int | None = None,
+    memory_limit: int | str | None = None,
+    tmpdir: str | None = None,
 ) -> None:
     """
     Shard a large .h5ad or .zarr file into smaller files using minimal RAM.
 
-    For .h5ad inputs, uses AnnData backed-mode reading so h5py streams each
-    shard's rows without loading the full matrix into memory.
-
-    For .zarr inputs, uses :func:`_open_zarr_backed` which wraps X and sparse
-    layers as ``CSRDataset`` objects (``anndata.io.sparse_dataset``), giving
-    the same out-of-core behaviour without requiring backed-mode support in
-    AnnData's zarr reader.
+    X and every layer stay on disk: the input is opened lazily (see
+    :func:`annslicer._common._open_lazy`) and only the rows of the shard being written are
+    ever read.  Without shuffling, each shard is one contiguous read.  With shuffling, a
+    two-pass scatter / gather (see :mod:`annslicer._shuffle`) keeps all reads sequential at
+    the cost of temporary scratch space.
 
     Parameters
     ----------
@@ -105,96 +69,95 @@ def shard_h5ad(
         HDF5 compression filter to use when writing shard ``.h5ad`` files,
         e.g. ``"gzip"`` or ``"lzf"``.  ``None`` (default) writes
         uncompressed files, which is fastest for downstream streaming reads.
+    n_jobs:
+        Number of worker processes for shuffled sharding (ignored when ``shuffle=False``).
+        ``None`` (default) uses ``min(available CPUs, 8)``, fewer for small inputs, and
+        is further limited by ``memory_limit``.  When calling from a script with ``n_jobs > 1``,
+        no ``if __name__ == "__main__":`` guard is needed.
+    memory_limit:
+        Memory budget used to size the workers' blocks and to limit how many run at once,
+        as bytes or a string such as ``"16GB"``.  Defaults to half of the available RAM.  It is
+        a sizing target, not a hard cap.
+    tmpdir:
+        Directory for the temporary scratch files of shuffled sharding (about the size of the
+        uncompressed matrices).  Defaults to the system temp directory.
     """
     _ensure_parent_dir(output_prefix)
 
-    if input_file.endswith(".zarr"):
-        logger.info("Opening zarr store %s in backed mode via sparse_dataset...", input_file)
-        adata = _open_zarr_backed(input_file)
-    else:
-        logger.info("Opening %s in backed mode...", input_file)
-        adata = ad.read_h5ad(input_file, backed="r")
-
+    logger.info("Opening %s lazily...", input_file)
+    data = _open_lazy(input_file)
     try:
         _shard_store(
-            adata, output_prefix, output_filenames, shard_size, shuffle, seed, compression
+            input_file,
+            data,
+            output_prefix,
+            output_filenames,
+            shard_size,
+            shuffle,
+            seed,
+            compression,
+            n_jobs,
+            memory_limit,
+            tmpdir,
         )
     finally:
-        if hasattr(adata, "file") and adata.file.is_open:
-            adata.file.close()
+        data.close()
 
 
 def _shard_store(
-    adata: ad.AnnData,
+    input_file: str,
+    data: LazyData,
     output_prefix: str,
     output_filenames: list[str] | None,
     shard_size: int,
     shuffle: bool,
     seed: int | None,
     compression: str | None = None,
+    n_jobs: int | None = None,
+    memory_limit: int | str | None = None,
+    tmpdir: str | None = None,
 ) -> None:
     """
-    Core sharding loop operating on an already-opened AnnData object.
+    Core sharding loop operating on an already-opened :class:`LazyData`.
 
-    Reads each shard directly via h5py slice/fancy indexing and constructs an
-    in-memory AnnData from the pieces before writing.  For shuffled output,
-    indices are sorted prior to reading (sequential I/O), then reordered in
-    memory into the target permutation order, avoiding random disk seeks.
+    Unshuffled shards are contiguous row ranges, read with one slice per matrix.  Shuffled
+    shards come from :func:`annslicer._shuffle.shuffled_shards`.
     """
-    if (
-        output_filenames is not None
-        and len(output_filenames) < (adata.n_obs + shard_size - 1) // shard_size
-    ):
+    total_cells = data.n_obs
+    n_shards = (total_cells + shard_size - 1) // shard_size
+    if output_filenames is not None and len(output_filenames) < n_shards:
         raise ValueError(
             f"Not enough output filenames provided: expected at least "
-            f"{(adata.n_obs + shard_size - 1) // shard_size}, got {len(output_filenames)}"
+            f"{n_shards}, got {len(output_filenames)}"
         )
-
-    total_cells = adata.n_obs
-
-    perm: np.ndarray | None = None
-    if shuffle:
-        perm = np.random.default_rng(seed).permutation(total_cells)
-        logger.info("Shuffle enabled (seed=%s). Permutation generated.", seed)
+    out_names = (
+        output_filenames[:n_shards]
+        if output_filenames is not None
+        else [f"{output_prefix}_shard_{i}.h5ad" for i in range(n_shards)]
+    )
 
     logger.info("Total cells: %d. Generating shards of %d...", total_cells, shard_size)
 
-    for start_idx in range(0, total_cells, shard_size):
-        end_idx = min(start_idx + shard_size, total_cells)
-        shard_num = start_idx // shard_size
-        out_filename = (
-            output_filenames[shard_num]
-            if output_filenames is not None
-            else f"{output_prefix}_shard_{shard_num}.h5ad"
+    if shuffle:
+        logger.info("Shuffle enabled (seed=%s).", seed)
+        shuffled_shards(
+            input_file,
+            data,
+            out_names,
+            shard_size,
+            seed,
+            compression,
+            n_jobs,
+            memory_limit,
+            tmpdir,
         )
-        logger.info("  Writing %s (cells %d–%d)...", out_filename, start_idx, end_idx)
-
-        if perm is not None:
-            orig_idx = perm[start_idx:end_idx]
-            sorted_idx = np.sort(orig_idx)
-            restore = np.argsort(np.argsort(orig_idx))
-            X = _unwrap(adata.X[sorted_idx, :])[restore]
-            layers = {
-                k: _unwrap(adata.layers[k][sorted_idx, :])[restore]
-                for k in adata.layers
-                if k is not None
-            }
-            obsm = {k: np.asarray(adata.obsm[k][sorted_idx])[restore] for k in adata.obsm}
-            obs = adata.obs.iloc[orig_idx]
-            ad.AnnData(
-                X=X,
-                obs=obs.copy(),
-                var=adata.var.copy(),
-                obsm=obsm,
-                layers=layers,
-                uns=adata.uns.copy(),
-            ).write_h5ad(out_filename, compression=compression)
-        else:
+    else:
+        for shard_num, out_filename in enumerate(out_names):
+            start_idx = shard_num * shard_size
+            end_idx = min(start_idx + shard_size, total_cells)
+            logger.info("  Writing %s (cells %d–%d)...", out_filename, start_idx, end_idx)
             _write_shard_from_indices(
-                adata,
-                np.arange(start_idx, end_idx, dtype=np.intp),
-                out_filename,
-                compression,
+                data, np.arange(start_idx, end_idx, dtype=np.intp), out_filename, compression
             )
 
     logger.info("All shards successfully created.")
@@ -244,16 +207,11 @@ def shard_by_obs_column(
     """
     _ensure_parent_dir(output_prefix)
 
-    if input_file.endswith(".zarr"):
-        logger.info("Opening zarr store %s in backed mode via sparse_dataset...", input_file)
-        adata = _open_zarr_backed(input_file)
-    else:
-        logger.info("Opening %s in backed mode...", input_file)
-        adata = ad.read_h5ad(input_file, backed="r")
-
+    logger.info("Opening %s lazily...", input_file)
+    data = _open_lazy(input_file)
     try:
         _shard_by_obs_column_store(
-            adata,
+            data,
             output_prefix,
             obs_column,
             csv_file,
@@ -262,12 +220,11 @@ def shard_by_obs_column(
             compression,
         )
     finally:
-        if hasattr(adata, "file") and adata.file.is_open:
-            adata.file.close()
+        data.close()
 
 
 def _shard_by_obs_column_store(
-    adata: ad.AnnData,
+    data: LazyData,
     output_prefix: str,
     obs_column: str,
     csv_file: str | None,
@@ -275,15 +232,15 @@ def _shard_by_obs_column_store(
     always_include: list[str] | None,
     compression: str | None,
 ) -> None:
-    """Core logic for :func:`shard_by_obs_column` operating on an open AnnData."""
+    """Core logic for :func:`shard_by_obs_column` operating on an open :class:`LazyData`."""
     # --- Merge auxiliary CSV into obs if provided ---
     if csv_file is not None:
-        adata.obs = _merge_csv_into_obs(adata.obs, csv_file, obs_column, join_column)
+        data.obs = _merge_csv_into_obs(data.obs, csv_file, obs_column, join_column)
 
     # --- Validate obs_column is categorical ---
-    if obs_column not in adata.obs.columns:
+    if obs_column not in data.obs.columns:
         raise KeyError(f"obs_column {obs_column!r} not found in adata.obs.")
-    obs_col = adata.obs[obs_column]
+    obs_col = data.obs[obs_column]
     if not isinstance(obs_col.dtype, pd.CategoricalDtype):
         raise ValueError(
             f"obs_column {obs_column!r} has dtype {obs_col.dtype!r}, expected a categorical. "
@@ -342,7 +299,7 @@ def _shard_by_obs_column_store(
             len(cat_idx),
             len(always_idx),
         )
-        _write_shard_from_indices(adata, indices, out_filename, compression)
+        _write_shard_from_indices(data, indices, out_filename, compression)
         shards_written += 1
 
     logger.info(
@@ -389,6 +346,35 @@ def register_subcommand(subparsers: argparse._SubParsersAction[argparse.Argument
         default=None,
         metavar="N",
         help="Random seed for reproducible shuffling (requires --shuffle).",
+    )
+    p.add_argument(
+        "--jobs",
+        "-j",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Worker processes for --shuffle (default: min(available CPUs, 8), fewer for "
+            "small inputs; further limited by --memory-limit)."
+        ),
+    )
+    p.add_argument(
+        "--memory-limit",
+        default=None,
+        metavar="SIZE",
+        help=(
+            "Memory budget for --shuffle workers, e.g. 16GB (default: half of available RAM). "
+            "A sizing target, not a hard cap."
+        ),
+    )
+    p.add_argument(
+        "--tmpdir",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Directory for --shuffle scratch files, about the size of the uncompressed "
+            "matrices (default: the system temp directory)."
+        ),
     )
     p.add_argument(
         "--compression",
@@ -459,4 +445,7 @@ def _run(args: argparse.Namespace) -> None:
             shuffle=args.shuffle,
             seed=args.seed,
             compression=args.compression,
+            n_jobs=args.jobs,
+            memory_limit=args.memory_limit,
+            tmpdir=args.tmpdir,
         )

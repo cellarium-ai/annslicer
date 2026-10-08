@@ -10,8 +10,8 @@ import logging
 import anndata as ad
 import numpy as np
 import pandas as pd
-from anndata.io import read_elem
 
+from annslicer._common import read_elem
 from annslicer._store import _is_sparse_group, _require_zarr, _store_create_array, open_store
 
 logger = logging.getLogger(__name__)
