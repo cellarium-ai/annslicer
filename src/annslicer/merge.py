@@ -11,7 +11,8 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-from annslicer._common import read_elem
+from annslicer._common import _DROPPED_MESSAGE, _dropped_groups, read_elem
+from annslicer._obs import merge_obs
 from annslicer._store import _is_sparse_group, _require_zarr, _store_create_array, open_store
 
 logger = logging.getLogger(__name__)
@@ -319,10 +320,13 @@ def merge_out_of_core(
     obs_list: list[pd.DataFrame] = []
     layer_keys_per_shard: list[set[str]] = []
     total_cells: int = 0
+    dropped: dict[str, list[str]] = {}
 
     for f in input_files:
         store = open_store(f, "r")
         try:
+            if groups := _dropped_groups(store):
+                dropped[f] = groups
             var_frames.append(read_elem(store["var"]))
             obs_df: pd.DataFrame = read_elem(store["obs"])
             obs_list.append(obs_df)
@@ -333,6 +337,11 @@ def merge_out_of_core(
         finally:
             if hasattr(store, "close"):
                 store.close()
+
+    if dropped:
+        first, groups = next(iter(dropped.items()))
+        names = ", ".join(groups) + (f" (in {len(dropped)} shards)" if len(dropped) > 1 else "")
+        logger.warning(_DROPPED_MESSAGE, first, names)
 
     store_first = open_store(input_files[0], "r")
     try:
@@ -350,12 +359,12 @@ def merge_out_of_core(
         set.intersection(*layer_keys_per_shard) if layer_keys_per_shard else set()
     )
 
-    merged_obs = pd.concat(obs_list, axis=0)
+    merged_obs = merge_obs(obs_list)
     skeleton = ad.AnnData(obs=merged_obs, var=merged_var, uns=uns)
     if is_zarr:
-        skeleton.write_zarr(output_file)
+        skeleton.write_zarr(output_file, convert_strings_to_categoricals=False)
     else:
-        skeleton.write_h5ad(output_file)
+        skeleton.write_h5ad(output_file, convert_strings_to_categoricals=False)
 
     logger.info("Skeleton saved to %s. Total cells: %d", output_file, total_cells)
 

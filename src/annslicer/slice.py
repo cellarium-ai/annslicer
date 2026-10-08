@@ -75,7 +75,7 @@ def shard_h5ad(
         e.g. ``"gzip"`` or ``"lzf"``.  ``None`` (default) writes
         uncompressed files, which is fastest for downstream streaming reads.
     n_jobs:
-        Number of worker processes.  ``None`` (default) uses ``min(available CPUs, 8)``, fewer
+        Number of worker processes.  ``None`` (default) uses one per available CPU, fewer
         for small inputs, and is further limited by ``memory_limit``.  When calling from a
         script with ``n_jobs > 1``, no ``if __name__ == "__main__":`` guard is needed.
     memory_limit:
@@ -366,7 +366,7 @@ def register_subcommand(subparsers: argparse._SubParsersAction[argparse.Argument
         default=None,
         metavar="N",
         help=(
-            "Worker processes (default: min(available CPUs, 8), fewer for small inputs; "
+            "Worker processes (default: one per available CPU, fewer for small inputs; "
             "further limited by --memory-limit)."
         ),
     )

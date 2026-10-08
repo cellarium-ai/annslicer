@@ -307,7 +307,7 @@ def shuffled_shards(
     """
     Write ``out_names[j]`` as shard ``j`` of a random permutation of the cells of *data*.
 
-    See the module docstring for the algorithm.  ``n_jobs=None`` picks ``min(CPUs, 8)`` (fewer
+    See the module docstring for the algorithm.  ``n_jobs=None`` picks one worker per CPU (fewer
     for small inputs); ``memory_limit=None`` uses half of the available RAM.  The memory limit
     is a sizing target for worker block sizes and counts, not a hard cap.  Scratch space of
     about the size of the uncompressed matrices is needed in *tmpdir* (default: the system

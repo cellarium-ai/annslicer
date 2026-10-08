@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from annslicer._obs import normalize_obs
 from annslicer._store import open_store
 
 try:
@@ -27,6 +28,16 @@ except ImportError:  # anndata < 0.11
 logger = logging.getLogger(__name__)
 
 _SPARSE_ENCODINGS = ("csr_matrix", "csc_matrix")
+_DROPPED_GROUPS = ("obsp", "varm", "varp", "raw")
+_DROPPED_MESSAGE = (
+    "%s contains %s, which annslicer does not carry over: output files hold only "
+    "X, layers, obs, var, obsm and uns."
+)
+
+
+def _dropped_groups(root: Any) -> list[str]:
+    """The non-empty groups of an opened store that annslicer does not write to its outputs."""
+    return [key for key in _DROPPED_GROUPS if key in root and len(root[key]) > 0]
 
 
 @dataclass
@@ -88,7 +99,10 @@ def _open_lazy(path: str) -> LazyData:
         data.X = _lazy_matrix(root, "X")
     if "layers" in root:
         data.layers = {k: _lazy_matrix(root["layers"], k) for k in root["layers"]}
-    data.obs = read_elem(root["obs"])
+    dropped = _dropped_groups(root)
+    if dropped:
+        logger.warning(_DROPPED_MESSAGE, path, ", ".join(dropped))
+    data.obs = normalize_obs(read_elem(root["obs"]))
     data.var = read_elem(root["var"])
     data.obsm = read_elem(root["obsm"]) if "obsm" in root else {}
     data.uns = read_elem(root["uns"]) if "uns" in root else {}
@@ -147,7 +161,7 @@ def _write_h5ad_shard(
         obsm=obsm,
         layers=layers,
         uns=uns.copy(),
-    ).write_h5ad(out_filename, compression=compression)
+    ).write_h5ad(out_filename, compression=compression, convert_strings_to_categoricals=False)
 
 
 def _write_shard_from_indices(

@@ -67,7 +67,7 @@ def contiguous_shards(
     """
     Write ``out_names[j]`` as the ``j``-th run of ``shard_size`` consecutive cells of *data*.
 
-    ``n_jobs=None`` picks ``min(CPUs, 8)`` (fewer for small inputs); ``memory_limit=None`` uses
+    ``n_jobs=None`` picks one worker per CPU (fewer for small inputs); ``memory_limit=None`` uses
     half of the available RAM.  The memory limit caps how many workers run at once, given that
     each holds about one shard; it is a sizing target, not a hard cap.
     """

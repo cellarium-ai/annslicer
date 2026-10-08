@@ -80,7 +80,7 @@ Both `.h5ad` and `.zarr` inputs are supported.
 | `--size N` | Number of cells per shard (default: `10000`) |
 | `--shuffle` | Randomly assign cells to shards (each shard is a representative draw) |
 | `--seed N` | Random seed for reproducible shuffling (requires `--shuffle`) |
-| `--jobs N`, `-j N` | Worker processes (default: `min(available CPUs, 8)`, fewer for small inputs; further limited by `--memory-limit`) |
+| `--jobs N`, `-j N` | Worker processes (default: one per available CPU, fewer for small inputs; further limited by `--memory-limit`) |
 | `--memory-limit SIZE` | Memory budget for the workers, e.g. `16GB` (default: half of the available RAM). A sizing target, not a hard cap |
 | `--tmpdir PATH` | Directory for `--shuffle` scratch files (default: the system temp directory); see [Shuffling and scratch space](#shuffling-and-scratch-space) |
 | `--compression FILTER` | HDF5 compression filter for shard files (e.g. `gzip`, `lzf`); default: no compression |
@@ -117,6 +117,16 @@ annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 10000 --compression
 ```
 
 Produces: `atlas_shard_0.h5ad`, `atlas_shard_1.h5ad`, …
+
+#### What the shards contain
+
+Every output file holds `X`, the layers, `obs`, `var`, `obsm` and `uns`. **`obsp`, `varm`, `varp` and `raw` are not carried over** (annslicer logs a warning if the input has any of them).
+
+`obs` columns are written so that all shards agree:
+
+- A **categorical column keeps all of its categories in every shard**, including categories that no cell of that shard uses, so the shards can be compared and merged without harmonising them first.
+- A categorical column with **more than 50,000 categories is not treated as categorical**. If all its categories are numbers (including numbers stored as text, like `"0.70218"`) it is written as a numeric column, using 32-bit integers or floats whenever that loses nothing; otherwise it is written as a plain string column, with missing values as empty strings. Columns with 50,000 categories or fewer always stay categorical, whatever they look like (cluster `0..30`, donor `"001"`). The limit is `MAX_CATEGORIES` in `annslicer/_obs.py`.
+- A **plain string column stays a plain string column**: it is not turned into a categorical, which anndata would otherwise do separately in each shard, giving every shard different categories. Missing values are written as empty strings.
 
 #### Categorical sharding by obs column
 
@@ -215,6 +225,8 @@ annslicer merge output.h5ad "shards/atlas_shard_*.h5ad"
 
 When shards have **different gene sets**, `--join outer` (default) takes the union of all genes and fills missing entries with zeros; `--join inner` keeps only genes present in every shard. Layers absent from any shard are always dropped.
 
+Shards do not need matching `obs` categories. A column that is categorical in any shard comes out categorical, with the **union of all shards' categories** in order of first appearance (plain strings from other shards are added as categories, and shards without the column get missing values). If the shards disagree on the type of a column's values (numbers in one, text in another), the values are cast to strings and a message is logged. As in slicing, a merged categorical with more than 50,000 categories is written as a numeric or string column instead. Category order is not preserved beyond first appearance, and the categories' "ordered" flag is kept only if every shard has identical ordered categories. Colour lists in `uns` (such as `leiden_colors`) come from the first shard and are not updated to match merged categories.
+
 ### Global options
 
 | Flag | Description |
@@ -235,7 +247,7 @@ shard_h5ad("large_atlas.zarr", "atlas", shard_size=20000)  # requires annslicer[
 # Shuffled sharding — cells are randomly distributed across shards
 shard_h5ad("large_atlas.h5ad", "atlas", shard_size=20000, shuffle=True, seed=0)
 
-# Explicit resources, for shuffled or unshuffled sharding (defaults: n_jobs=min(CPUs, 8), memory_limit=half of RAM).
+# Explicit resources, for shuffled or unshuffled sharding (defaults: n_jobs=one per CPU, memory_limit=half of RAM).
 # Worker processes are started safely, so no `if __name__ == "__main__":` guard is needed.
 shard_h5ad(
     "large_atlas.h5ad",
@@ -326,7 +338,7 @@ merge_out_of_core(["shard_a.h5ad", "shard_b.h5ad"], "merged.h5ad", join="inner")
 4. Collects the indices of cells where the column is `True` and writes them to a new file.
 
 ### Merging
-1. Reads `obs`, `var`, and `uns` from **all** shards to build a skeleton output file.
+1. Reads `obs`, `var`, and `uns` from **all** shards to build a skeleton output file; the `obs` tables are combined column by column, taking the union of the categories of categorical columns.
 2. Computes the merged `var` index: union (outer join) or intersection (inner join) of gene sets across all shards. If every shard shares the identical `var`, remapping is skipped entirely (fast path).
 3. Scans shards to calculate total non-zero sizes for pre-allocation (for an inner join, entries for excluded genes are filtered during the scan).
 4. Streams `X`, layers, and `obsm` data shard-by-shard directly into the pre-allocated output arrays, remapping column indices on the fly where needed.
@@ -379,7 +391,7 @@ The 2.4M single-cell heart dataset at https://singlecell.broadinstitute.org/sing
 
 This benchmark can be reproduced by running
 ```console
-make benchmark INPUT=HeartMap_V1.0_raw_counts.h5ad PYTEST_ARGS="--log-cli-level=INFO"
+make benchmark INPUT=HeartMap_V1.0_raw_counts.h5ad PYTEST_ARGS="--log-cli-level=INFO --benchmark-json=results.json"
 ```
 on a google `n1-standard-16` VM with 60GB RAM and a 500GB SSD boot disk. Benchmarks here all write gzipped output files.
 

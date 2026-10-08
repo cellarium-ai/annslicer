@@ -11,7 +11,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_MAX_AUTO_JOBS = 8
 _MEMORY_FRACTION = 0.5  # default memory limit, as a fraction of total (or cgroup-limited) RAM
 _FALLBACK_MEMORY = 4 * 1024**3
 _MIN_BYTES_PER_JOB = 256 * 1024**2  # don't pay worker start-up costs for smaller jobs
@@ -69,14 +68,13 @@ def _resolve_resources(
     """
     Resolve the requested worker count and memory limit into concrete numbers.
 
-    ``n_jobs=None`` picks ``min(CPUs, 8)``, fewer when *total_bytes* (the in-memory size of the
-    data to process) is too small to be worth the worker start-up cost.  ``memory_limit=None``
-    uses half of the available RAM.
+    ``n_jobs=None`` picks one worker per available CPU, fewer when *total_bytes* (the in-memory
+    size of the data to process) is too small to be worth the worker start-up cost; the planners
+    then reduce it further to fit the memory limit.  ``memory_limit=None`` uses half of the
+    available RAM.
     """
     if n_jobs is None:
-        n_jobs = min(
-            _available_cpus(), _MAX_AUTO_JOBS, max(1, int(total_bytes // _MIN_BYTES_PER_JOB))
-        )
+        n_jobs = min(_available_cpus(), max(1, int(total_bytes // _MIN_BYTES_PER_JOB)))
     elif n_jobs < 1:
         raise ValueError(f"n_jobs must be at least 1, got {n_jobs}.")
     limit = _default_memory_limit() if memory_limit is None else _parse_size(memory_limit)
