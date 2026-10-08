@@ -18,6 +18,43 @@ N_CELLS = 150
 N_GENES = 50
 
 
+def _sparse_adata() -> ad.AnnData:
+    """150 × 50 AnnData with sparse X (incl. empty rows), sparse + dense layers, obsm."""
+    rng = np.random.default_rng(7)
+    X = sp.random(N_CELLS, N_GENES, density=0.2, format="lil", dtype=np.float32, random_state=rng)
+    X[[0, 17, 149], :] = 0  # all-zero rows at the start, middle and end
+    return ad.AnnData(
+        X=X.tocsr(),
+        obs=pd.DataFrame(
+            {"cell_type": [f"type_{i % 3}" for i in range(N_CELLS)]},
+            index=[f"cell_{i}" for i in range(N_CELLS)],
+        ),
+        var=pd.DataFrame(index=[f"gene_{j}" for j in range(N_GENES)]),
+        obsm={"X_pca": rng.random((N_CELLS, 10))},
+        layers={
+            "counts": sp.csr_matrix(rng.integers(0, 5, (N_CELLS, N_GENES)).astype(np.int32)),
+            "dense": rng.random((N_CELLS, N_GENES), dtype=np.float32),
+        },
+    )
+
+
+@pytest.fixture(scope="session")
+def synthetic_sparse_h5ad(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """An .h5ad whose X is sparse, with one sparse and one dense layer."""
+    path = str(tmp_path_factory.mktemp("sparse_data") / "sparse.h5ad")
+    _sparse_adata().write_h5ad(path)
+    return path
+
+
+@pytest.fixture(scope="session")
+def synthetic_sparse_zarr(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """The sparse-X dataset as a .zarr store (skipped if zarr is not installed)."""
+    pytest.importorskip("zarr", reason="zarr not installed; skipping zarr tests")
+    path = str(tmp_path_factory.mktemp("sparse_zarr_data") / "sparse.zarr")
+    _sparse_adata().write_zarr(path)
+    return path
+
+
 @pytest.fixture(scope="session")
 def synthetic_h5ad(tmp_path_factory: pytest.TempPathFactory) -> str:
     """

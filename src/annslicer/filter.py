@@ -10,12 +10,15 @@ from __future__ import annotations
 import argparse
 import logging
 
-import anndata as ad
 import numpy as np
 import pandas as pd
 
-from annslicer._common import _merge_csv_into_obs, _write_shard_from_indices
-from annslicer.slice import _open_zarr_backed
+from annslicer._common import (
+    LazyData,
+    _merge_csv_into_obs,
+    _open_lazy,
+    _write_shard_from_indices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,34 +64,28 @@ def filter_h5ad(
     compression:
         HDF5 compression filter for the output file (e.g. ``"gzip"``).
     """
-    if input_file.endswith(".zarr"):
-        logger.info("Opening zarr store %s in backed mode via sparse_dataset...", input_file)
-        adata = _open_zarr_backed(input_file)
-    else:
-        logger.info("Opening %s in backed mode...", input_file)
-        adata = ad.read_h5ad(input_file, backed="r")
-
+    logger.info("Opening %s lazily...", input_file)
+    data = _open_lazy(input_file)
     try:
-        _filter_store(adata, output_file, obs_column, csv_file, join_column, compression)
+        _filter_store(data, output_file, obs_column, csv_file, join_column, compression)
     finally:
-        if hasattr(adata, "file") and adata.file.is_open:
-            adata.file.close()
+        data.close()
 
 
 def _filter_store(
-    adata: ad.AnnData,
+    data: LazyData,
     output_file: str,
     obs_column: str,
     csv_file: str | None,
     join_column: str | None,
     compression: str | None,
 ) -> None:
-    """Core logic for :func:`filter_h5ad` operating on an open AnnData."""
+    """Core logic for :func:`filter_h5ad` operating on an open :class:`LazyData`."""
     # --- Merge auxiliary CSV into obs if provided ---
     if csv_file is not None:
-        adata.obs = _merge_csv_into_obs(adata.obs, csv_file, obs_column, join_column)
+        data.obs = _merge_csv_into_obs(data.obs, csv_file, obs_column, join_column)
 
-    col = adata.obs[obs_column]
+    col = data.obs[obs_column]
 
     # --- Lenient boolean coercion ---
     if col.dtype == bool or pd.api.types.is_bool_dtype(col):
@@ -108,7 +105,7 @@ def _filter_store(
         bool_col = mapped.astype(bool)
 
     keep_idx = np.where(bool_col)[0]
-    cells_in = adata.n_obs
+    cells_in = data.n_obs
     cells_out = len(keep_idx)
     logger.info(
         "Filtering %s: %d cells in → %d cells out → %s",
@@ -117,7 +114,7 @@ def _filter_store(
         cells_out,
         output_file,
     )
-    _write_shard_from_indices(adata, keep_idx, output_file, compression)
+    _write_shard_from_indices(data, keep_idx, output_file, compression)
     logger.info("Filter complete.")
 
 

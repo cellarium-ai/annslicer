@@ -11,8 +11,13 @@ lint:
 typecheck:
 	mypy src/annslicer
 
+# Usage: make benchmark [INPUT=path/to/file.h5ad] [PYTEST_ARGS="--bench-jobs 1,4,8 ..."]
+# (see CONTRIBUTING.md; `pytest benchmarks/ --help` lists the --bench-* options)
+INPUT ?=
+PYTEST_ARGS ?=
+
 benchmark:
-	pytest benchmarks/ --benchmark-only -v -s
+	pytest benchmarks/ --benchmark-only -v -s $(if $(INPUT),--bench-input "$(INPUT)") $(PYTEST_ARGS)
 
 build-check:
 	@echo "--- Building sdist and wheel ---"

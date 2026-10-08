@@ -36,7 +36,7 @@ annslicer merge output.h5ad shard_*.h5ad
 - Constant, low memory footprint regardless of file size
 - Input supports both `.h5ad` and `.zarr` formats for slicing and filtering
 - Merge output supports both `.h5ad` and `.zarr` formats
-- **Fixed-size sharding** (`--size`) with optional random cell shuffling
+- **Fixed-size sharding** (`--size`) with optional random cell shuffling — out-of-core, with shards written in parallel (`--jobs`)
 - **Categorical sharding** (`--obs-column`) — one shard per category value, named by category
 - **Always-include cells** — append control cells (e.g. non-targeting controls) to every shard
 - **Auxiliary CSV metadata** — provide extra `obs` columns from a CSV file without modifying the source
@@ -80,6 +80,9 @@ Both `.h5ad` and `.zarr` inputs are supported.
 | `--size N` | Number of cells per shard (default: `10000`) |
 | `--shuffle` | Randomly assign cells to shards (each shard is a representative draw) |
 | `--seed N` | Random seed for reproducible shuffling (requires `--shuffle`) |
+| `--jobs N`, `-j N` | Worker processes (default: one per available CPU, fewer for small inputs; further limited by `--memory-limit`) |
+| `--memory-limit SIZE` | Memory budget for the workers, e.g. `16GB` (1 GB = 10⁹ bytes; `GiB` for powers of 1024) (default: half of the available RAM). A sizing target, not a hard cap |
+| `--tmpdir PATH` | Directory for `--shuffle` scratch files (default: the system temp directory); see [Shuffling and scratch space](#shuffling-and-scratch-space) |
 | `--compression FILTER` | HDF5 compression filter for shard files (e.g. `gzip`, `lzf`); default: no compression |
 
 **Example — basic sharding:**
@@ -94,6 +97,19 @@ annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 20000
 annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 10000 --shuffle --seed 0
 ```
 
+**Example — shuffled sharding with explicit resources:**
+
+```bash
+annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 10000 --shuffle --seed 0 \
+    --jobs 8 --memory-limit 32GB --tmpdir /local/scratch
+```
+
+#### Shuffling and scratch space
+
+Shuffling needs scratch space: temporary files about the size of the (uncompressed) `X` and layer matrices, in `--tmpdir` (default: the system temp directory, e.g. `$TMPDIR`). Point it at a large local disk if the default is small. The scratch files are removed when the run finishes or fails, and annslicer checks the free space up front.
+
+The same seed always produces the same shards, regardless of `--jobs`, `--memory-limit`, or `--tmpdir`.
+
 **Example — gzip-compressed shards:**
 
 ```bash
@@ -101,6 +117,16 @@ annslicer slice /data/large_atlas.h5ad /outputs/atlas --size 10000 --compression
 ```
 
 Produces: `atlas_shard_0.h5ad`, `atlas_shard_1.h5ad`, …
+
+#### What the shards contain
+
+Every output file holds `X`, the layers, `obs`, `var`, `obsm` and `uns`. **`obsp`, `varm`, `varp` and `raw` are not carried over** (annslicer logs a warning if the input has any of them).
+
+`obs` columns are written so that all shards agree:
+
+- A **categorical column keeps all of its categories in every shard**, including categories that no cell of that shard uses, so the shards can be compared and merged without harmonising them first.
+- A categorical column with **more than 50,000 categories is not treated as categorical**. If all its categories are numbers (including numbers stored as text, like `"0.70218"`) it is written as a numeric column, using 32-bit integers or floats whenever that loses nothing; otherwise it is written as a plain string column, with missing values as empty strings. Columns with 50,000 categories or fewer always stay categorical, whatever they look like (cluster `0..30`, donor `"001"`). The limit is `MAX_CATEGORIES` in `annslicer/_obs.py`.
+- A **plain string column stays a plain string column**: it is not turned into a categorical, which anndata would otherwise do separately in each shard, giving every shard different categories. Missing values are written as empty strings.
 
 #### Categorical sharding by obs column
 
@@ -199,6 +225,8 @@ annslicer merge output.h5ad "shards/atlas_shard_*.h5ad"
 
 When shards have **different gene sets**, `--join outer` (default) takes the union of all genes and fills missing entries with zeros; `--join inner` keeps only genes present in every shard. Layers absent from any shard are always dropped.
 
+Shards do not need matching `obs` categories. A column that is categorical in any shard comes out categorical, with the **union of all shards' categories** in order of first appearance (plain strings from other shards are added as categories, and shards without the column get missing values). If the shards disagree on the type of a column's values (numbers in one, text in another), the values are cast to strings and a message is logged. As in slicing, a merged categorical with more than 50,000 categories is written as a numeric or string column instead. Category order is not preserved beyond first appearance, and the categories' "ordered" flag is kept only if every shard has identical ordered categories. Colour lists in `uns` (such as `leiden_colors`) come from the first shard and are not updated to match merged categories.
+
 ### Global options
 
 | Flag | Description |
@@ -218,6 +246,19 @@ shard_h5ad("large_atlas.zarr", "atlas", shard_size=20000)  # requires annslicer[
 
 # Shuffled sharding — cells are randomly distributed across shards
 shard_h5ad("large_atlas.h5ad", "atlas", shard_size=20000, shuffle=True, seed=0)
+
+# Explicit resources, for shuffled or unshuffled sharding (defaults: n_jobs=one per CPU, memory_limit=half of RAM).
+# Worker processes are started safely, so no `if __name__ == "__main__":` guard is needed.
+shard_h5ad(
+    "large_atlas.h5ad",
+    "atlas",
+    shard_size=20000,
+    shuffle=True,
+    seed=0,
+    n_jobs=8,
+    memory_limit="32GB",
+    tmpdir="/local/scratch",
+)
 
 # Gzip-compressed shards — smaller files at the cost of write speed
 shard_h5ad("large_atlas.h5ad", "atlas", shard_size=20000, compression="gzip")
@@ -275,11 +316,13 @@ merge_out_of_core(["shard_a.h5ad", "shard_b.h5ad"], "merged.h5ad", join="inner")
 ## How it works
 
 ### Fixed-size slicing
-1. Opens the input file ("backed" AnnData for `.h5ad`; `anndata.io.sparse_dataset` for `.zarr`).
-2. If `shuffle=True`, generates a global cell permutation upfront using `numpy.random.default_rng`.
-3. For each shard, reads only the relevant rows from `X` and each layer via sorted fancy indexing — no full matrix is ever loaded into memory.
-4. When shuffling, rows are read in sorted index order (maximising sequential I/O) and then reordered in-memory to the desired shuffled order.
-5. Reassembles a valid `AnnData` object per shard and writes it to disk.
+1. Opens the input file lazily for both `.h5ad` and `.zarr`: `X` and every layer stay on disk (sparse matrices through `anndata.io.sparse_dataset`, dense ones as plain h5py / zarr arrays), while `obs`, `var`, `obsm` and `uns` are read into memory.
+2. Without shuffling, each shard is one contiguous row range, read with a single slice per matrix. Shards are independent, so worker processes each read and write their own shards in parallel.
+3. With shuffling, a global cell permutation is generated up front with `numpy.random.default_rng(seed)`, and the shards are built in two sequential passes instead of fetching each shard's cells at random from the input (which costs a small read per cell, or a chunk decompression per cell for compressed input):
+   - **Pass 1 (scatter):** worker processes stream the input in contiguous row blocks, sort each block's rows by the shard they belong to, and write them to scratch files.
+   - **Pass 2 (gather):** worker processes read back the rows of each group of shards from the scratch files, put them in their final shuffled order, and write the shards.
+4. The number of workers (and, when shuffling, the block sizes) are chosen from `--memory-limit`, so memory stays bounded however large the file is.
+5. Each shard is reassembled into a valid `AnnData` object and written to disk.
 
 ### Categorical slicing
 1. Opens the input file in the same backed/lazy mode as fixed-size slicing.
@@ -295,37 +338,72 @@ merge_out_of_core(["shard_a.h5ad", "shard_b.h5ad"], "merged.h5ad", join="inner")
 4. Collects the indices of cells where the column is `True` and writes them to a new file.
 
 ### Merging
-1. Reads `obs`, `var`, and `uns` from **all** shards to build a skeleton output file.
+1. Reads `obs`, `var`, and `uns` from **all** shards to build a skeleton output file; the `obs` tables are combined column by column, taking the union of the categories of categorical columns.
 2. Computes the merged `var` index: union (outer join) or intersection (inner join) of gene sets across all shards. If every shard shares the identical `var`, remapping is skipped entirely (fast path).
 3. Scans shards to calculate total non-zero sizes for pre-allocation (for an inner join, entries for excluded genes are filtered during the scan).
 4. Streams `X`, layers, and `obsm` data shard-by-shard directly into the pre-allocated output arrays, remapping column indices on the fly where needed.
 5. Layers absent from any shard are dropped so every cell has consistent layer coverage.
 
-> **Note:** CSC (column-compressed) sparse matrices are not supported for out-of-core row-slicing. Convert to CSR before sharding.
+> **Note:** CSC (column-compressed) sparse matrices are not supported for out-of-core row-slicing. Convert to CSR before sharding; `--shuffle` rejects CSC input with an error.
 
 ## Benchmarks
 
-Run on a dummy sparse anndata object with 200k cells and 10k genes.
+Run on a synthetic sparse anndata object with 40k cells and 30k genes (about 1,500 non-zeros per cell; `X` and one layer, about 1 GB of uncompressed data), cut into 5k-cell shards, on a laptop with warm file caches. All shards are written gzip-compressed, for annslicer and the baselines alike. Reproduce with `make benchmark`, or benchmark your own `.h5ad` file with `make benchmark INPUT=my_file.h5ad` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
+The `anndata` baselines use only what anndata itself offers: `read_h5ad(backed="r")` for h5ad, and `read_zarr` for zarr, which loads the whole store into memory because anndata has no backed mode for zarr. The `annslicer` shuffle rows marked "1 job" run in a single process, so their memory is directly comparable with the baselines.
 
 ### For h5ad format
 
 | Slicing method | Mean runtime (s) | Peak memory (MB) |
 |---|---|---|
-| `annslicer slice` | 0.584 | 211.4 |
-| `anndata` backed | 0.601 | 203.7 |
-| `annslicer slice --shuffle` | 1.731 | 221.8 |
-| `anndata` backed with shuffle | 3.830 | 209.1 |
+| `anndata` backed | 18.3 | 614 |
+| `annslicer slice` (1 job) | 18.0 | 134 |
+| `annslicer slice --jobs 4` (explicit 4 workers) | 5.4 | ≈1295 (all processes)\* |
+| `anndata` backed with shuffle | 19.3 | 616 |
+| `annslicer slice --shuffle` (1 job) | 19.1 | 491 |
+| `annslicer slice --shuffle --jobs 4` (explicit 4 workers) | 6.0 | ≈2569 (all processes)\* |
 
 ### For zarr format
 
 | Slicing method | Mean runtime (s) | Peak memory (MB) |
 |---|---|---|
-| `annslicer slice` | 1.050 | 62.1 |
-| `anndata` backed | 0.799 | 54.4 |
-| `annslicer slice --shuffle` | 5.544 | 142.9 |
-| `anndata` backed with shuffle | 6.591 | 151.4 |
+| `anndata` `read_zarr` (in memory) | 18.9 | 1095 |
+| `annslicer slice` (1 job) | 18.3 | 142 |
+| `annslicer slice --jobs 4` (explicit 4 workers) | 5.5 | ≈1590 (all processes)\* |
+| `anndata` `read_zarr` (in memory) with shuffle | 20.0 | 1096 |
+| `annslicer slice --shuffle` (1 job) | 19.4 | 491 |
+| `annslicer slice --shuffle --jobs 4` (explicit 4 workers) | 6.1 | ≈2978 (all processes)\* |
 
-Based on these benchmarks, for making randomly shuffled data shards, we recommend using `annslicer slice --shuffle` on an h5ad format file.
+\* Summed resident memory of the main process and its workers, sampled during the run: an upper-bound estimate, since it counts shared pages once per process. It grows roughly linearly with the number of workers: each holds about one shard's worth of buffers plus its own imported libraries. `--memory-limit` caps the number of workers.
+
+What these show:
+
+- **Time:** compressing the output shards (gzip) dominates the run time here, so single-process annslicer is on par with the anndata baselines, shuffled or not. Parallel workers split that work: 4 jobs were about 3x faster, shuffled or not.
+- **Memory, unshuffled:** at one job annslicer holds only the shard being written: more than 4x less than anndata's backed mode and about 8x less than `read_zarr`, which has to hold the whole store. With several workers the total grows with the worker count.
+- **Memory, shuffled:** at one job annslicer uses somewhat less than the baselines. With several workers the total grows with the worker count, bounded by `--memory-limit`.
+- **Where the shuffle design matters most is not measured here:** this input is uncompressed and sits in the file cache, which is the best case for per-cell random reads (the anndata backed shuffle). Compressed or cold-storage inputs make those reads much slower, while annslicer reads the input sequentially, once. Use `make benchmark INPUT=...` to measure your own data.
+
+For shuffled sharding of files too large for memory, use `annslicer slice --shuffle`.
+
+## Real usage on real data
+
+The 2.4M single-cell heart dataset at https://singlecell.broadinstitute.org/single_cell/study/SCP3689 is around 44GB on disk.
+
+This benchmark can be reproduced by running
+```console
+make benchmark INPUT=HeartMap_V1.0_raw_counts.h5ad PYTEST_ARGS="--log-cli-level=INFO --benchmark-json=results.json"
+```
+on a google `n1-standard-16` VM with 60GB RAM and a 500GB SSD boot disk. Benchmarks here all write gzipped output files.
+
+| Slicing method | Mean runtime (s) | Peak memory (MB) |
+|---|---|---|
+| `anndata` backed with shuffle | 1593 | ≈4465 |
+| `annslicer slice --shuffle --jobs 1` (forced 1 job) | 1113 | ≈4485 |
+| `annslicer slice --shuffle --jobs auto` (used 16 workers) | 163 | ≈16923 (all processes)\* |
+
+\* As in the tables above. The 248 output shards total about 12 GB (gzip), roughly 48 MB each.
+
+With one job annslicer is about 1.4x faster than the `anndata` backed shuffle at the same memory. With all 16 vCPUs it is about 10x faster, and memory grows to roughly 1 GB per worker, well within the default memory limit (half of the 60GB RAM).
 
 ## License
 
