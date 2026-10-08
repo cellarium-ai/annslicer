@@ -171,7 +171,7 @@ def _shard_store(
         "All %d shards successfully created in %s (%.1f GB written).",
         n_shards,
         _fmt_duration(time.monotonic() - start),
-        written / 1024**3,
+        written / 1e9,
     )
 
 
@@ -375,8 +375,8 @@ def register_subcommand(subparsers: argparse._SubParsersAction[argparse.Argument
         default=None,
         metavar="SIZE",
         help=(
-            "Memory budget for the workers, e.g. 16GB (default: half of available RAM). "
-            "A sizing target, not a hard cap."
+            "Memory budget for the workers, e.g. 16GB, where 1 GB is 10^9 bytes (use GiB for "
+            "powers of 1024); default: half of available RAM. A sizing target, not a hard cap."
         ),
     )
     p.add_argument(

@@ -275,7 +275,7 @@ def dataset_info(large_h5ad: str) -> dict:
         "n_vars": n_vars,
         "nnz_per_cell": nnz_per_cell,
         "n_layers": n_layers,
-        "input_MiB": round(os.path.getsize(large_h5ad) / 2**20, 1),
+        "input_MB": round(os.path.getsize(large_h5ad) / 1e6, 1),
         "input_compression": compression,
     }
 

@@ -12,10 +12,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _MEMORY_FRACTION = 0.5  # default memory limit, as a fraction of total (or cgroup-limited) RAM
-_FALLBACK_MEMORY = 4 * 1024**3
-_MIN_BYTES_PER_JOB = 256 * 1024**2  # don't pay worker start-up costs for smaller jobs
+_FALLBACK_MEMORY = 4 * 10**9
+_MIN_BYTES_PER_JOB = 256 * 10**6  # don't pay worker start-up costs for smaller jobs
 _ROW_OVERHEAD = 16  # per-row bytes beyond the values: destination position + indptr entry
-_SIZE_UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+_SIZE_PREFIXES = {"": 0, "K": 1, "M": 2, "G": 3, "T": 4}
 
 
 def _available_cpus() -> int:
@@ -43,13 +43,19 @@ def _default_memory_limit() -> int:
 
 
 def _parse_size(value: int | float | str) -> int:
-    """Parse a byte count such as ``8_000_000_000``, ``"8GB"``, ``"512MiB"`` or ``"1.5G"``."""
+    """
+    Parse a byte count such as ``8_000_000_000``, ``"8GB"``, ``"512MB"`` or ``"1.5G"``.
+
+    K, M, G and T are powers of 1000 (``"8GB"`` is 8 × 10⁹ bytes); with an ``i`` (``"8GiB"``)
+    they are powers of 1024.
+    """
     if isinstance(value, (int, float)):
         return int(value)
-    match = re.fullmatch(r"\s*([\d.]+)\s*([KMGT]?)I?B?\s*", value, re.IGNORECASE)
+    match = re.fullmatch(r"\s*([\d.]+)\s*([KMGT]?)(I?)B?\s*", value, re.IGNORECASE)
     if match is None:
         raise ValueError(f"Cannot parse memory size {value!r}; use e.g. '8GB' or '512MB'.")
-    return int(float(match.group(1)) * _SIZE_UNITS[match.group(2).upper()])
+    base = 1024 if match.group(3) else 1000
+    return int(float(match.group(1)) * base ** _SIZE_PREFIXES[match.group(2).upper()])
 
 
 def _row_bytes(mat: Any) -> float:

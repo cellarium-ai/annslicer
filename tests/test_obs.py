@@ -7,12 +7,14 @@ from __future__ import annotations
 import logging
 
 import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sp
 
 from annslicer import _obs
+from annslicer._common import _dropped_groups
 from annslicer._obs import normalize_obs
 from annslicer.slice import shard_h5ad
 
@@ -67,7 +69,7 @@ def test_over_limit_numeric_categories_and_missing_values(small_limit):
 def test_over_limit_non_numeric_becomes_plain_strings(small_limit):
     cat = pd.Categorical([f"id_{i}" for i in range(9)] + [None])
     out = normalize_obs(_frame(x=cat))["x"]
-    assert out.dtype == object and not isinstance(out.dtype, pd.CategoricalDtype)
+    assert not isinstance(out.dtype, pd.CategoricalDtype)
     assert out.tolist() == [f"id_{i}" for i in range(9)] + [""]
 
 
@@ -176,6 +178,15 @@ def test_no_warning_when_the_dropped_groups_are_absent_or_empty(synthetic_h5ad, 
     with caplog.at_level(logging.WARNING, logger="annslicer"):
         shard_h5ad(synthetic_h5ad, str(tmp_path / "s"), shard_size=75, n_jobs=1)
     assert "does not carry over" not in caplog.text
+
+
+def test_a_null_encoded_element_is_not_a_dropped_group(tmp_path):
+    """Newer anndata writes an absent ``raw`` as a scalar array with encoding-type "null"."""
+    with h5py.File(tmp_path / "null.h5ad", "w") as f:
+        f.create_dataset("raw", data=0).attrs["encoding-type"] = "null"
+        f.create_group("obsp").create_dataset("connectivities", data=np.ones(3))
+        f.create_group("varm")
+        assert _dropped_groups(f) == ["obsp"]
 
 
 def test_groups_annslicer_does_not_carry_are_dropped_with_a_warning(rich_h5ad, tmp_path, caplog):

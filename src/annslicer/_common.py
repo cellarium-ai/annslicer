@@ -37,7 +37,12 @@ _DROPPED_MESSAGE = (
 
 def _dropped_groups(root: Any) -> list[str]:
     """The non-empty groups of an opened store that annslicer does not write to its outputs."""
-    return [key for key in _DROPPED_GROUPS if key in root and len(root[key]) > 0]
+    # Newer anndata stores an absent element (e.g. ``raw=None``) as a scalar "null" array.
+    return [
+        key
+        for key in _DROPPED_GROUPS
+        if key in root and root[key].attrs.get("encoding-type") != "null" and len(root[key]) > 0
+    ]
 
 
 @dataclass

@@ -203,7 +203,15 @@ def test_plan_wide_buckets_for_many_small_shards():
 
 @pytest.mark.parametrize(
     "text, expected",
-    [("512", 512), ("1KB", 1024), ("2MiB", 2 * 1024**2), ("1.5G", int(1.5 * 1024**3)), (7, 7)],
+    [
+        ("512", 512),
+        ("1KB", 1000),
+        ("8GB", 8 * 10**9),
+        ("1.5G", 1_500_000_000),
+        ("2MiB", 2 * 1024**2),
+        ("1 gib", 1024**3),
+        (7, 7),
+    ],
 )
 def test_parse_size(text, expected):
     assert _resources._parse_size(text) == expected

@@ -82,8 +82,8 @@ def contiguous_shards(
         logger.warning(
             "A single shard needs about %.1f GB to write, more than the %.1f GB memory limit; "
             "use a smaller --size or a larger --memory-limit.",
-            shard_bytes / 1024**3,
-            limit / 1024**3,
+            shard_bytes / 1e9,
+            limit / 1e9,
         )
     n_jobs = max(1, min(n_jobs, n_shards, int(limit // max(shard_bytes, 1))))
     logger.info("Writing %d shards with %d worker(s).", n_shards, n_jobs)

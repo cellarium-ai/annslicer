@@ -81,7 +81,7 @@ Both `.h5ad` and `.zarr` inputs are supported.
 | `--shuffle` | Randomly assign cells to shards (each shard is a representative draw) |
 | `--seed N` | Random seed for reproducible shuffling (requires `--shuffle`) |
 | `--jobs N`, `-j N` | Worker processes (default: one per available CPU, fewer for small inputs; further limited by `--memory-limit`) |
-| `--memory-limit SIZE` | Memory budget for the workers, e.g. `16GB` (default: half of the available RAM). A sizing target, not a hard cap |
+| `--memory-limit SIZE` | Memory budget for the workers, e.g. `16GB` (1 GB = 10⁹ bytes; `GiB` for powers of 1024) (default: half of the available RAM). A sizing target, not a hard cap |
 | `--tmpdir PATH` | Directory for `--shuffle` scratch files (default: the system temp directory); see [Shuffling and scratch space](#shuffling-and-scratch-space) |
 | `--compression FILTER` | HDF5 compression filter for shard files (e.g. `gzip`, `lzf`); default: no compression |
 
@@ -356,23 +356,23 @@ The `anndata` baselines use only what anndata itself offers: `read_h5ad(backed="
 
 | Slicing method | Mean runtime (s) | Peak memory (MB) |
 |---|---|---|
-| `anndata` backed | 18.3 | 586 |
-| `annslicer slice` (1 job) | 18.0 | 128 |
-| `annslicer slice --jobs 4` (explicit 4 workers) | 5.4 | ≈1235 (all processes)\* |
-| `anndata` backed with shuffle | 19.3 | 587 |
-| `annslicer slice --shuffle` (1 job) | 19.1 | 468 |
-| `annslicer slice --shuffle --jobs 4` (explicit 4 workers) | 6.0 | ≈2450 (all processes)\* |
+| `anndata` backed | 18.3 | 614 |
+| `annslicer slice` (1 job) | 18.0 | 134 |
+| `annslicer slice --jobs 4` (explicit 4 workers) | 5.4 | ≈1295 (all processes)\* |
+| `anndata` backed with shuffle | 19.3 | 616 |
+| `annslicer slice --shuffle` (1 job) | 19.1 | 491 |
+| `annslicer slice --shuffle --jobs 4` (explicit 4 workers) | 6.0 | ≈2569 (all processes)\* |
 
 ### For zarr format
 
 | Slicing method | Mean runtime (s) | Peak memory (MB) |
 |---|---|---|
-| `anndata` `read_zarr` (in memory) | 18.9 | 1044 |
-| `annslicer slice` (1 job) | 18.3 | 135 |
-| `annslicer slice --jobs 4` (explicit 4 workers) | 5.5 | ≈1516 (all processes)\* |
-| `anndata` `read_zarr` (in memory) with shuffle | 20.0 | 1045 |
-| `annslicer slice --shuffle` (1 job) | 19.4 | 468 |
-| `annslicer slice --shuffle --jobs 4` (explicit 4 workers) | 6.1 | ≈2840 (all processes)\* |
+| `anndata` `read_zarr` (in memory) | 18.9 | 1095 |
+| `annslicer slice` (1 job) | 18.3 | 142 |
+| `annslicer slice --jobs 4` (explicit 4 workers) | 5.5 | ≈1590 (all processes)\* |
+| `anndata` `read_zarr` (in memory) with shuffle | 20.0 | 1096 |
+| `annslicer slice --shuffle` (1 job) | 19.4 | 491 |
+| `annslicer slice --shuffle --jobs 4` (explicit 4 workers) | 6.1 | ≈2978 (all processes)\* |
 
 \* Summed resident memory of the main process and its workers, sampled during the run: an upper-bound estimate, since it counts shared pages once per process. It grows roughly linearly with the number of workers: each holds about one shard's worth of buffers plus its own imported libraries. `--memory-limit` caps the number of workers.
 
@@ -397,9 +397,13 @@ on a google `n1-standard-16` VM with 60GB RAM and a 500GB SSD boot disk. Benchma
 
 | Slicing method | Mean runtime (s) | Peak memory (MB) |
 |---|---|---|
-| `anndata` backed with shuffle |  |  |
-| `annslicer slice --shuffle` (1 job) |  |  |
-| `annslicer slice --shuffle --jobs auto` (used 4 workers) |  | ≈ (all processes)\* |
+| `anndata` backed with shuffle | 1593 | ≈4465 |
+| `annslicer slice --shuffle --jobs 1` (forced 1 job) | 1113 | ≈4485 |
+| `annslicer slice --shuffle --jobs auto` (used 16 workers) | 163 | ≈16923 (all processes)\* |
+
+\* As in the tables above. The 248 output shards total about 12 GB (gzip), roughly 48 MB each.
+
+With one job annslicer is about 1.4x faster than the `anndata` backed shuffle at the same memory. With all 16 vCPUs it is about 10x faster, and memory grows to roughly 1 GB per worker, well within the default memory limit (half of the 60GB RAM).
 
 ## License
 

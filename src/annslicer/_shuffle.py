@@ -98,8 +98,8 @@ def _plan(
         logger.warning(
             "A single shard needs about %.1f GB to assemble, more than the %.1f GB memory limit; "
             "use a smaller --size or a larger --memory-limit.",
-            bucket_bytes / 1024**3,
-            memory_limit / 1024**3,
+            bucket_bytes / 1e9,
+            memory_limit / 1e9,
         )
     jobs = max(1, min(jobs, int(memory_limit // bucket_bytes)))
     return _Plan(jobs, block_rows, shards_per_bucket)
@@ -341,7 +341,7 @@ def shuffled_shards(
         n_buckets,
         len(blocks),
         plan.n_jobs,
-        spill_bytes / 1024**3,
+        spill_bytes / 1e9,
     )
 
     # perm[p] is the input row that lands at output position p; dest is its inverse.
@@ -357,7 +357,7 @@ def shuffled_shards(
         if free < spill_bytes * 1.05:
             raise OSError(
                 f"Not enough scratch space in {os.path.dirname(scratch)}: need about "
-                f"{spill_bytes / 1024**3:.1f} GB, {free / 1024**3:.1f} GB free. "
+                f"{spill_bytes / 1e9:.1f} GB, {free / 1e9:.1f} GB free. "
                 f"Point --tmpdir / tmpdir at a larger local disk."
             )
         np.save(os.path.join(scratch, "dest.npy"), dest)

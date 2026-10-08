@@ -26,12 +26,12 @@ Run with:
     pytest benchmarks/ --benchmark-only -v
 
 Memory: single-process runs report tracemalloc's high-water mark
-(``extra_info["peak_memory_MiB"]``).  tracemalloc only sees the current process
+(``extra_info["peak_memory_MB"]``).  tracemalloc only sees the current process
 and only Python-level allocations, so runs with several worker processes, and all
-runs on a ``--bench-input`` file, instead report ``extra_info["peak_tree_RSS_MiB"]``:
+runs on a ``--bench-input`` file, instead report ``extra_info["peak_tree_RSS_MB"]``:
 the peak summed resident memory of the process and all its workers.  That is an
 upper-bound estimate, since pages shared between processes are counted once per
-process, and it includes the memory of the imported libraries (a few hundred MiB
+process, and it includes the memory of the imported libraries (a few hundred MB
 per process).  With ``--bench-input`` every benchmark runs once and time and memory
 come from that same run.
 """
@@ -61,18 +61,18 @@ BENCH_ROUNDS = 2
 
 
 def _run_with_memory(fn, *args, **kwargs) -> float:
-    """Run *fn*, return peak Python heap allocation in MiB (tracemalloc high-water mark)."""
+    """Run *fn*, return peak Python heap allocation in MB (tracemalloc high-water mark)."""
     tracemalloc.start()
     try:
         fn(*args, **kwargs)
         _, peak_bytes = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    return peak_bytes / (1024**2)
+    return peak_bytes / 1e6
 
 
-def _tree_rss_mib() -> float:
-    """Summed resident memory (MiB) of this process and all its descendants, via ``ps``."""
+def _tree_rss_mb() -> float:
+    """Summed resident memory (MB) of this process and all its descendants, via ``ps``."""
     rows = subprocess.run(
         ["ps", "-A", "-o", "pid=,ppid=,rss="], capture_output=True, text=True, check=True
     ).stdout.splitlines()
@@ -90,18 +90,18 @@ def _tree_rss_mib() -> float:
             if child not in tree:
                 tree.add(child)
                 todo.append(child)
-    return sum(rss_kib[p] for p in tree) / 1024
+    return sum(rss_kib[p] for p in tree) * 1024 / 1e6
 
 
 def _run_with_tree_rss(fn, *args, **kwargs) -> float:
-    """Run *fn*, return the peak of :func:`_tree_rss_mib`, sampled every 100 ms, in MiB."""
-    peak = _tree_rss_mib()
+    """Run *fn*, return the peak of :func:`_tree_rss_mb`, sampled every 100 ms, in MB."""
+    peak = _tree_rss_mb()
     done = threading.Event()
 
     def _sample():
         nonlocal peak
         while not done.wait(0.1):
-            peak = max(peak, _tree_rss_mib())
+            peak = max(peak, _tree_rss_mb())
 
     sampler = threading.Thread(target=_sample, daemon=True)
     sampler.start()
@@ -140,12 +140,12 @@ def _run_benchmark(
         peak = _run_with_tree_rss(fn) if tree else _run_with_memory(fn)
         benchmark.pedantic(fn, rounds=BENCH_ROUNDS, iterations=1, warmup_rounds=0)
 
-    benchmark.extra_info["peak_tree_RSS_MiB" if tree else "peak_memory_MiB"] = round(peak, 1)
+    benchmark.extra_info["peak_tree_RSS_MB" if tree else "peak_memory_MB"] = round(peak, 1)
     kind = "peak tree RSS (est.)" if tree else "peak RAM"
     suffix = f"  (memory limit {memory_limit})" if memory_limit else ""
     workers = benchmark.extra_info.get("workers")
     suffix += f"  [{workers} worker(s)]" if workers else ""
-    print(f"\n  [{label}] {kind}: {peak:.1f} MiB{suffix}")
+    print(f"\n  [{label}] {kind}: {peak:.1f} MB{suffix}")
 
 
 class _WorkerCount(logging.Handler):
