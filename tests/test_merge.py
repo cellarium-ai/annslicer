@@ -850,3 +850,44 @@ def test_merge_validate_detects_corrupt_indptr(mismatched_pair: tuple, tmp_path:
     with h5py.File(out, "r") as f:
         with pytest.raises(RuntimeError, match="negative values"):
             _validate_merge_indptr(f, {"X": expected_nnz})
+
+
+# ---------------------------------------------------------------------------
+# Input validation: CSR-only inputs, output must not be an input
+# ---------------------------------------------------------------------------
+
+
+def _write_sparse_shard(tmp_path: Path, name: str, fmt: str) -> str:
+    X = sp.random(10, 5, density=0.5, format=fmt, dtype=np.float32, random_state=0)
+    adata = ad.AnnData(
+        X=X,
+        obs=pd.DataFrame(index=[f"{name}_cell{i}" for i in range(10)]),
+        var=pd.DataFrame(index=[f"gene{i}" for i in range(5)]),
+    )
+    path = str(tmp_path / f"{name}.h5ad")
+    adata.write_h5ad(path)
+    return path
+
+
+def test_csc_shard_is_rejected_and_named(tmp_path: Path) -> None:
+    """Only the CSC shard is named in the error, and no output file is written."""
+    good = _write_sparse_shard(tmp_path, "good_csr", "csr")
+    bad = _write_sparse_shard(tmp_path, "bad_csc", "csc")
+    out = tmp_path / "out.h5ad"
+    with pytest.raises(ValueError, match="CSR") as excinfo:
+        merge_out_of_core([good, bad], str(out))
+
+    message = str(excinfo.value)
+    assert "bad_csc" in message
+    assert "good_csr" not in message
+    assert not out.exists()
+
+
+def test_output_file_cannot_be_an_input(tmp_path: Path) -> None:
+    """An output path that is also an input raises and leaves that input intact."""
+    a = _write_sparse_shard(tmp_path, "a", "csr")
+    b = _write_sparse_shard(tmp_path, "b", "csr")
+    size_before = Path(b).stat().st_size
+    with pytest.raises(ValueError, match="also one of the input files"):
+        merge_out_of_core([a, b], b)
+    assert Path(b).stat().st_size == size_before

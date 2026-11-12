@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 
 import anndata as ad
 import numpy as np
@@ -13,7 +14,13 @@ import pandas as pd
 
 from annslicer._common import _DROPPED_MESSAGE, _dropped_groups, read_elem
 from annslicer._obs import merge_obs
-from annslicer._store import _is_sparse_group, _require_zarr, _store_create_array, open_store
+from annslicer._store import (
+    _is_sparse_group,
+    _require_zarr,
+    _sparse_encoding,
+    _store_create_array,
+    open_store,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +57,61 @@ def _sort_indices_within_rows(
     row_ids = np.repeat(np.arange(len(row_nnz), dtype=np.int64), row_nnz)
     order = np.lexsort((indices, row_ids))
     return indices[order], data[order]
+
+
+def _check_output_not_an_input(input_files: list[str], output_file: str) -> None:
+    """Raise if *output_file* is also one of the inputs.
+
+    The merge overwrites the output file with a fresh skeleton before it streams
+    any shard data, so an output that doubles as an input would destroy that
+    input.  Paths are compared after resolving symlinks and relative segments.
+    """
+    out = os.path.realpath(output_file)
+    for f in input_files:
+        if os.path.realpath(f) == out:
+            raise ValueError(
+                f"The output file '{output_file}' is also one of the input files "
+                f"('{f}'). Merging would overwrite that input. This often happens when "
+                f"a glob such as '*.h5ad' matches the output of an earlier run; choose "
+                f"an output path that no input matches, or remove the stale output."
+            )
+
+
+def _require_csr_matrices(
+    encodings: dict[str, dict[str, str | None]], active_layers: set[str]
+) -> None:
+    """Raise if any matrix that will be merged is stored as CSC (or another non-CSR format).
+
+    The merge streams ``indices`` / ``indptr`` as row-compressed data, so CSC
+    input would be silently misread (its ``indices`` are cell numbers, not genes).
+
+    Parameters
+    ----------
+    encodings:
+        ``{shard_path: {matrix_path: encoding-type or None}}`` for every sparse
+        matrix found in the shard (``"X"`` and ``"layers/<name>"``).
+    active_layers:
+        Layers that will actually be merged; sparse layers outside this set are
+        dropped, so their format is irrelevant.
+    """
+    wanted = {"X", *(f"layers/{name}" for name in active_layers)}
+    bad = [
+        f"'{shard}' ({path}: {enc})"
+        for shard, per_matrix in encodings.items()
+        for path, enc in per_matrix.items()
+        # enc is None only for legacy files with no encoding-type attribute; those are
+        # not classified, so they keep the previous (unchecked) behaviour.
+        if path in wanted and enc is not None and enc != "csr_matrix"
+    ]
+    if bad:
+        shown = ", ".join(bad[:5])
+        more = f", … (+{len(bad) - 5} more)" if len(bad) > 5 else ""
+        raise ValueError(
+            f"merge requires sparse matrices stored as CSR (csr_matrix) or dense, but "
+            f"{len(bad)} matrix(es) are not CSR: {shown}{more}. Convert those shards to "
+            f"CSR first (e.g. load with anndata and call `adata.X = adata.X.tocsr()`, "
+            f"then write them again). No output file was written."
+        )
 
 
 def _compute_merged_var(
@@ -311,6 +373,9 @@ def merge_out_of_core(
     if is_zarr:
         _require_zarr()
 
+    # Must run before anything is written: the skeleton overwrites output_file.
+    _check_output_not_an_input(input_files, output_file)
+
     # -----------------------------------------------------------------------
     # Phase 1: gather metadata (obs, var, uns) with minimal memory
     # -----------------------------------------------------------------------
@@ -319,12 +384,24 @@ def merge_out_of_core(
     var_frames: list[pd.DataFrame] = []
     obs_list: list[pd.DataFrame] = []
     layer_keys_per_shard: list[set[str]] = []
+    sparse_encodings: dict[str, dict[str, str | None]] = {}
     total_cells: int = 0
     dropped: dict[str, list[str]] = {}
 
     for f in input_files:
         store = open_store(f, "r")
         try:
+            # Record each sparse matrix's storage format (an attribute read, no matrix data).
+            per_matrix: dict[str, str | None] = {}
+            if "X" in store and _is_sparse_group(store, "X"):
+                per_matrix["X"] = _sparse_encoding(store, "X")
+            if "layers" in store:
+                for layer_name in store["layers"].keys():
+                    lpath = f"layers/{layer_name}"
+                    if _is_sparse_group(store, lpath):
+                        per_matrix[lpath] = _sparse_encoding(store, lpath)
+            sparse_encodings[f] = per_matrix
+
             if groups := _dropped_groups(store):
                 dropped[f] = groups
             var_frames.append(read_elem(store["var"]))
@@ -358,6 +435,9 @@ def merge_out_of_core(
     active_layers: set[str] = (
         set.intersection(*layer_keys_per_shard) if layer_keys_per_shard else set()
     )
+
+    # Still before the skeleton write below, so a rejected merge leaves output_file untouched.
+    _require_csr_matrices(sparse_encodings, active_layers)
 
     merged_obs = merge_obs(obs_list)
     skeleton = ad.AnnData(obs=merged_obs, var=merged_var, uns=uns)

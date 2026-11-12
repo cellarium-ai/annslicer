@@ -225,6 +225,8 @@ annslicer merge output.h5ad "shards/atlas_shard_*.h5ad"
 
 When shards have **different gene sets**, `--join outer` (default) takes the union of all genes and fills missing entries with zeros; `--join inner` keeps only genes present in every shard. Layers absent from any shard are always dropped.
 
+Shards' `X` and `layers` must be stored as CSR (or dense); CSC input is rejected up front with an error naming the offending shards, before any output is written. The output file must not also be one of the inputs (watch for globs like `*.h5ad` that match a previous output).
+
 Shards do not need matching `obs` categories. A column that is categorical in any shard comes out categorical, with the **union of all shards' categories** in order of first appearance (plain strings from other shards are added as categories, and shards without the column get missing values). If the shards disagree on the type of a column's values (numbers in one, text in another), the values are cast to strings and a message is logged. As in slicing, a merged categorical with more than 50,000 categories is written as a numeric or string column instead. Category order is not preserved beyond first appearance, and the categories' "ordered" flag is kept only if every shard has identical ordered categories. Colour lists in `uns` (such as `leiden_colors`) come from the first shard and are not updated to match merged categories.
 
 ### Global options

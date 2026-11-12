@@ -52,13 +52,24 @@ def open_store(path: str, mode: str = "r") -> Store:
 
 
 def _is_sparse_group(store: Store, key: str) -> bool:
-    """Return True if *store[key]* is a sparse CSR group rather than a dense dataset."""
+    """Return True if *store[key]* is a sparse (CSR or CSC) group rather than a dense dataset."""
     item = store[key]
     if isinstance(item, h5py.Dataset):
         return False
     # For both h5py.Group and zarr.Group the presence of 'data' + 'indptr'
-    # sub-keys indicates a sparse CSR representation.
+    # sub-keys indicates a compressed sparse representation (CSR or CSC).
     return "data" in item and "indptr" in item
+
+
+def _sparse_encoding(store: Store, key: str) -> str | None:
+    """Return the ``encoding-type`` of the sparse group at *store[key]*, or None if not sparse.
+
+    The result is ``"csr_matrix"`` or ``"csc_matrix"`` for files written by anndata.
+    A sparse group with no ``encoding-type`` attribute also yields None.
+    """
+    if not _is_sparse_group(store, key):
+        return None
+    return store[key].attrs.get("encoding-type")  # type: ignore[no-any-return]
 
 
 def _store_create_array(
